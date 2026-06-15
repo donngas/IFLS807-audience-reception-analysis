@@ -22,4 +22,12 @@ ENV/
 *.sqlite
 *.sqlite3
 
+# Visualizations
+plots/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+
 
