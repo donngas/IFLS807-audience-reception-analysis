@@ -126,7 +126,11 @@ def test_stage_1_analysis(mock_openrouter):
     
     mock_response = MagicMock()
     mock_choice = MagicMock()
-    mock_choice.message.content = '{"sentiment": 0.5, "summary": "A good post.", "raw_tag": "positive feedback"}'
+    mock_choice.message.content = (
+        '{"sentiment": 0.5, "summary": "A good post.", '
+        '"is_substantive": true, "reception_reason": "positive feedback", '
+        '"raw_tag": "positive feedback"}'
+    )
     mock_response.choices = [mock_choice]
     mock_client_instance.chat.send.return_value = mock_response
     
@@ -148,6 +152,8 @@ def test_stage_1_analysis(mock_openrouter):
         assert annotation.item_type == "post"
         assert annotation.sentiment == 0.5
         assert annotation.raw_tag == "positive feedback"
+        assert annotation.is_substantive is True
+        assert annotation.reception_reason == "positive feedback"
         assert annotation.consolidated_tag is None
         assert annotation.cluster_id is None
         assert annotation.embedding is None
@@ -210,6 +216,71 @@ def test_stage_2_analysis(mock_openrouter, mock_hdbscan):
         assert annotation.cluster_explanation == "These reactions share appreciative responses to the relationship dynamic."
         assert annotation.cluster_id == 0
         assert annotation.embedding is not None
+
+
+@patch("analyzer.HDBSCAN")
+@patch("analyzer.OpenRouter")
+@patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
+def test_stage_2_excludes_non_substantive_annotations(mock_openrouter, mock_hdbscan):
+    mock_clusterer = MagicMock()
+    mock_clusterer.fit_predict.return_value = np.array([0, 0])
+    mock_hdbscan.return_value = mock_clusterer
+
+    mock_client_instance = MagicMock()
+    mock_openrouter.return_value.__enter__.return_value = mock_client_instance
+
+    mock_emb_res = MagicMock()
+    mock_emb_data = MagicMock()
+    mock_emb_data.embedding = [0.1] * 384
+    mock_emb_res.data = [mock_emb_data]
+    mock_client_instance.embeddings.generate.return_value = mock_emb_res
+
+    mock_response = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = '{"consolidated_tag": "Earned Payoff", "explanation": "The cluster focuses on payoff that feels earned."}'
+    mock_response.choices = [mock_choice]
+    mock_client_instance.chat.send.return_value = mock_response
+
+    with Session(test_engine) as session:
+        session.add(Annotation(
+            item_id="substantive_1",
+            item_type="post",
+            sentiment=0.5,
+            summary="The relationship growth felt earned.",
+            raw_tag="earned payoff",
+            is_substantive=True,
+            reception_reason="earned payoff",
+        ))
+        session.add(Annotation(
+            item_id="substantive_2",
+            item_type="post",
+            sentiment=0.5,
+            summary="The gradual buildup made the payoff work.",
+            raw_tag="earned payoff",
+            is_substantive=True,
+            reception_reason="earned payoff",
+        ))
+        session.add(Annotation(
+            item_id="reaction_only_1",
+            item_type="comment",
+            sentiment=1.0,
+            summary="The commenter expresses excitement without a specific reason.",
+            raw_tag="Reaction Only",
+            is_substantive=False,
+            reception_reason=None,
+        ))
+        session.commit()
+
+    from analyzer import run_stage_2_analysis
+    run_stage_2_analysis(min_cluster_size=2, labeling_model="test-model")
+
+    with Session(test_engine) as session:
+        reaction_only = session.get(Annotation, "reaction_only_1")
+        substantive = session.get(Annotation, "substantive_1")
+        assert reaction_only.embedding is None
+        assert reaction_only.cluster_id is None
+        assert reaction_only.consolidated_tag is None
+        assert substantive.consolidated_tag == "Earned Payoff"
 
 @patch("visualization.handle_output")
 def test_visualizations(mock_handle_output):
