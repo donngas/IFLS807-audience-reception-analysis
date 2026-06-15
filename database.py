@@ -34,7 +34,7 @@ class Annotation(SQLModel, table=True):
 
 # Database Connection & Setup
 
-sqlite_file_name = "audience_reception.db"
+sqlite_file_name = os.environ.get("WORKSPACE_DB", "audience_reception.db")
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url, echo=False)
 
