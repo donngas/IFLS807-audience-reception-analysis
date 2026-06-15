@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import sys
 import os
+import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from database import Post, Comment, SQLModel, Annotation
@@ -113,23 +114,39 @@ def test_stage_1_analysis(mock_openrouter):
         assert annotation.sentiment == 0.5
         assert annotation.raw_tag == "positive feedback"
         assert annotation.consolidated_tag is None
+        assert annotation.cluster_id is None
+        assert annotation.embedding is None
 
+@patch("analyzer.HDBSCAN")
 @patch("analyzer.OpenRouter")
 @patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
-def test_stage_2_analysis(mock_openrouter):
-    # Mock OpenRouter Response
+def test_stage_2_analysis(mock_openrouter, mock_hdbscan):
+    # Mock HDBSCAN
+    mock_clusterer = MagicMock()
+    mock_clusterer.fit_predict.return_value = np.array([0, 0])
+    mock_hdbscan.return_value = mock_clusterer
+
+    # Mock OpenRouter Response (both embeddings and chat labels)
     mock_client_instance = MagicMock()
     mock_openrouter.return_value.__enter__.return_value = mock_client_instance
     
+    # Mock Embeddings return value
+    mock_emb_res = MagicMock()
+    mock_emb_data = MagicMock()
+    mock_emb_data.embedding = [0.1] * 384
+    mock_emb_res.data = [mock_emb_data]
+    mock_client_instance.embeddings.generate.return_value = mock_emb_res
+    
+    # Mock Chat Label return value
     mock_response = MagicMock()
     mock_choice = MagicMock()
-    mock_choice.message.content = '{"tag_mappings": {"positive feedback": "Appreciation"}}'
+    mock_choice.message.content = '{"consolidated_tag": "Appreciation"}'
     mock_response.choices = [mock_choice]
     mock_client_instance.chat.send.return_value = mock_response
     
     with Session(test_engine) as session:
-        # Add an unmapped tag via Annotation record
-        ann = Annotation(
+        # Add two unmapped annotations to allow min_cluster_size=2
+        ann1 = Annotation(
             item_id="post_test_2",
             item_type="post",
             sentiment=0.5,
@@ -137,12 +154,23 @@ def test_stage_2_analysis(mock_openrouter):
             raw_tag="positive feedback",
             consolidated_tag=None
         )
-        session.add(ann)
+        ann2 = Annotation(
+            item_id="post_test_3",
+            item_type="post",
+            sentiment=0.5,
+            summary="Another good post.",
+            raw_tag="positive feedback",
+            consolidated_tag=None
+        )
+        session.add(ann1)
+        session.add(ann2)
         session.commit()
         
     from analyzer import run_stage_2_analysis
-    run_stage_2_analysis()
+    run_stage_2_analysis(min_cluster_size=2, labeling_model="test-model")
     
     with Session(test_engine) as session:
         annotation = session.get(Annotation, "post_test_2")
         assert annotation.consolidated_tag == "Appreciation"
+        assert annotation.cluster_id == 0
+        assert annotation.embedding is not None
