@@ -174,3 +174,60 @@ def test_stage_2_analysis(mock_openrouter, mock_hdbscan):
         assert annotation.consolidated_tag == "Appreciation"
         assert annotation.cluster_id == 0
         assert annotation.embedding is not None
+
+@patch("visualization.handle_output")
+def test_visualizations(mock_handle_output):
+    # Setup mock posts, comments, and annotations in test DB
+    import json
+    with Session(test_engine) as session:
+        p1 = Post(id="post_v1", subreddit="r/romance", title="Post V1", selftext="SelfText", score=10, created_utc=1000000.0)
+        c1 = Comment(id="comment_v1", post_id="post_v1", body="Comment V1", score=5, created_utc=1000060.0)
+        
+        ann_p = Annotation(
+            item_id="post_v1",
+            item_type="post",
+            sentiment=0.5,
+            summary="Summary Post",
+            raw_tag="love",
+            consolidated_tag="Affection",
+            cluster_id=0,
+            embedding=json.dumps([0.1] * 384)
+        )
+        
+        ann_c = Annotation(
+            item_id="comment_v1",
+            item_type="comment",
+            sentiment=-0.5,
+            summary="Summary Comment",
+            raw_tag="sad",
+            consolidated_tag="Angst",
+            cluster_id=1,
+            embedding=json.dumps([-0.1] * 384)
+        )
+        
+        session.add(p1)
+        session.add(c1)
+        session.add(ann_p)
+        session.add(ann_c)
+        session.commit()
+
+    from visualization import (
+        plot_semantic_map, plot_sentiment_by_theme,
+        plot_theme_trends_over_time, plot_subreddit_theme_distribution
+    )
+    
+    with Session(test_engine) as session:
+        # Run all visualization functions (interactive / preview mode)
+        plot_semantic_map(session)
+        plot_sentiment_by_theme(session)
+        plot_theme_trends_over_time(session)
+        plot_subreddit_theme_distribution(session)
+        
+        # Run in export mode
+        plot_semantic_map(session, save_path="plots/test_map.png")
+        plot_sentiment_by_theme(session, save_path="plots/test_sentiment.png")
+        plot_theme_trends_over_time(session, save_path="plots/test_trends.png")
+        plot_subreddit_theme_distribution(session, save_path="plots/test_subreddits.png")
+
+    assert mock_handle_output.call_count == 8
+
