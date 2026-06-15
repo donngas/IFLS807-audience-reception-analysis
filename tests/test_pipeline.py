@@ -231,21 +231,71 @@ def test_visualizations(mock_handle_output):
 
     assert mock_handle_output.call_count == 8
 
-@patch("scraper.fetch_unauthenticated_json")
+@patch("scraper.fetch_json")
 def test_scrape_reddit_json_mock(mock_fetch_json):
-    # Mock the return values for search and comments
+    # Mock the return values for search and comments matching PullPush structure
+    mock_search_res = {
+        "data": [
+            {
+                "id": "post_json1",
+                "subreddit": "testsub",
+                "title": "Test Post JSON",
+                "selftext": "Test Body JSON",
+                "score": 10,
+                "created_utc": 1000000.0,
+                "author": "User"
+            }
+        ]
+    }
+    
+    mock_comments_res = {
+        "data": [
+            {
+                "id": "comment_json1",
+                "body": "Test Comment JSON",
+                "score": 5,
+                "created_utc": 1000010.0,
+                "author": "User2"
+            }
+        ]
+    }
+    
+    # Simulate direct Reddit JSON scrape failing (e.g. 403) and falling back to PullPush
+    mock_fetch_json.side_effect = [
+        Exception("Direct search 403 Forbidden"),
+        mock_search_res,
+        mock_comments_res
+    ]
+    
+    from scraper import scrape_reddit
+    with patch("time.sleep"):
+        scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="json")
+        
+    with Session(test_engine) as session:
+        post = session.get(Post, "post_json1")
+        assert post is not None
+        assert post.title == "Test Post JSON"
+        
+        comment = session.get(Comment, "comment_json1")
+        assert comment is not None
+        assert comment.body == "Test Comment JSON"
+
+
+@patch("scraper.fetch_json")
+def test_scrape_reddit_json_direct_success_mock(mock_fetch_json):
+    # Mock the return values for search and comments matching Reddit's structure
     mock_search_res = {
         "data": {
             "children": [
                 {
                     "data": {
-                        "id": "post_json1",
+                        "id": "direct_post1",
                         "subreddit": "testsub",
-                        "title": "Test Post JSON",
-                        "selftext": "Test Body JSON",
-                        "score": 10,
-                        "created_utc": 1000000.0,
-                        "author": "User"
+                        "title": "Direct Post Title",
+                        "selftext": "Direct Post Body",
+                        "score": 15,
+                        "created_utc": 2000000.0,
+                        "author": "DirectUser"
                     }
                 }
             ]
@@ -253,18 +303,18 @@ def test_scrape_reddit_json_mock(mock_fetch_json):
     }
     
     mock_comments_res = [
-        {},
-        {
+        {}, # first element (post details)
+        {   # second element (comments list)
             "data": {
                 "children": [
                     {
                         "kind": "t1",
                         "data": {
-                            "id": "comment_json1",
-                            "body": "Test Comment JSON",
-                            "score": 5,
-                            "created_utc": 1000010.0,
-                            "author": "User2"
+                            "id": "direct_comment1",
+                            "body": "Direct Comment Body",
+                            "score": 8,
+                            "created_utc": 2000010.0,
+                            "author": "DirectUser2"
                         }
                     }
                 ]
@@ -279,12 +329,12 @@ def test_scrape_reddit_json_mock(mock_fetch_json):
         scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="json")
         
     with Session(test_engine) as session:
-        post = session.get(Post, "post_json1")
+        post = session.get(Post, "direct_post1")
         assert post is not None
-        assert post.title == "Test Post JSON"
+        assert post.title == "Direct Post Title"
         
-        comment = session.get(Comment, "comment_json1")
+        comment = session.get(Comment, "direct_comment1")
         assert comment is not None
-        assert comment.body == "Test Comment JSON"
+        assert comment.body == "Direct Comment Body"
 
 

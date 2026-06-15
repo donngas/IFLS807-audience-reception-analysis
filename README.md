@@ -31,11 +31,11 @@ end
 
 ### Module Descriptions
 
-- **`main.py`**: The central entrypoint. Supports command-line parameters (for automated scripting) and an interactive CLI wizard using `questionary` when run with no arguments. Includes database stats viewing and advanced record resetting options.
-- **`database.py`**: Defines the SQLModel database schemas and handles SQLite session connection and CRUD helper transactions (such as safe upserts and resetting pipeline states). Creates the SQLite file locally at `./audience_reception.db`.
-- **`scraper.py`**: Uses PRAW (Python Reddit API Wrapper) to fetch search results matching boolean query logic (e.g., `(Jake AND Amy)`) and scrape corresponding top-level comments. Supports configurable sort and time filters.
-- **`analyzer.py`**: Manages Stage 1 LLM inference (sentiment, summaries, raw tags) and Stage 2 HDBSCAN semantic clustering, caching embeddings, resolving noise outliers, and requesting cluster thematic labels from the LLM.
-- **`util.py`**: Provides import/export capabilities (CSV/JSON) to export processed data for external statistical or qualitative tools.
+- **`main.py`**: The central entrypoint. Supports command-line parameters and an interactive CLI wizard. Features **Workspace Selection** (to sandbox different couples into separate `.db` databases) and a **Search Query Builder** helper.
+- **`database.py`**: Defines SQLModel schemas and database helpers. The SQLite filename is dynamically loaded from the environment variable `WORKSPACE_DB` (defaulting to `audience_reception.db`) to keep workspaces separated.
+- **`scraper.py`**: Uses PRAW or unauthenticated JSON endpoints to fetch search results matching boolean query logic (e.g., `(Jake AND Amy)`) and scrape comments.
+- **`analyzer.py`**: Manages Stage 1 LLM inference (sentiment, summaries, raw tags) and Stage 2 HDBSCAN semantic clustering.
+- **`util.py`**: Provides CSV/JSON import/export utilities.
 
 ---
 
