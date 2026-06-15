@@ -33,7 +33,7 @@ def is_low_quality(author_name: str, body_text: str) -> bool:
         return True
     return False
 
-def scrape_reddit(query: str, subreddits: Optional[List[str]] = None, post_limit: int = 100, comment_limit: int = 100):
+def scrape_reddit(query: str, subreddits: Optional[List[str]] = None, post_limit: int = 100, comment_limit: int = 100, sort: str = "top", time_filter: str = "all", skip_existing: bool = True):
     reddit = get_praw_reddit()
     translated_query = translate_query(query)
     
@@ -44,10 +44,17 @@ def scrape_reddit(query: str, subreddits: Optional[List[str]] = None, post_limit
     else:
         target_subreddit = reddit.subreddit("all")
         
-    print(f"Scraping '{translated_query}' in r/{target_subreddit.display_name}...")
+    print(f"Scraping '{translated_query}' in r/{target_subreddit.display_name} (Sort: {sort}, Time: {time_filter})...")
     
     with Session(engine) as session:
-        for submission in target_subreddit.search(translated_query, sort="top", time_filter="all", limit=post_limit):
+        for submission in target_subreddit.search(translated_query, sort=sort, time_filter=time_filter, limit=post_limit):
+            # Check if post exists and skip_existing is True
+            if skip_existing:
+                existing = session.get(Post, submission.id)
+                if existing:
+                    print(f"Skipping already scraped post: {submission.id}")
+                    continue
+            
             # Process Post
             post_author = submission.author.name if submission.author else ""
             post_status = "skipped" if is_low_quality(post_author, submission.selftext) else "pending"
@@ -63,8 +70,7 @@ def scrape_reddit(query: str, subreddits: Optional[List[str]] = None, post_limit
             )
             upsert_post(session, post)
             
-            # If the post is skipped, we still process its comments? The plan says "If the post is skipped (e.g., author is AutoModerator...) Save post with status "pending" (or skipped)... Fetch top-level comments". Usually we fetch comments anyway. Let's fetch comments.
-            submission.comments.replace_more(limit=0) # Only top-level or whatever is loaded, limit=0 removes MoreComments
+            submission.comments.replace_more(limit=0) # Only top-level, limit=0 removes MoreComments
             comments_fetched = 0
             for comment in submission.comments:
                 if comments_fetched >= comment_limit:

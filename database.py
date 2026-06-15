@@ -28,6 +28,8 @@ class Annotation(SQLModel, table=True):
     summary: str
     raw_tag: str
     consolidated_tag: Optional[str] = Field(default=None, nullable=True)
+    cluster_id: Optional[int] = Field(default=None, nullable=True)
+    embedding: Optional[str] = Field(default=None, description="JSON serialized array of floats")
 
 
 # Database Connection & Setup
@@ -80,6 +82,81 @@ def update_consolidated_tags(session: Session, tag_mappings: dict[str, str]):
         for ann in annotations:
             ann.consolidated_tag = consolidated
             session.add(ann)
+    session.commit()
+
+def reset_failed_items(session: Session, item_type: str):
+    """Reset status of failed posts or comments back to pending"""
+    if item_type == "post":
+        statement = select(Post).where(Post.status == "failed")
+        items = session.exec(statement).all()
+        for item in items:
+            item.status = "pending"
+            session.add(item)
+    elif item_type == "comment":
+        statement = select(Comment).where(Comment.status == "failed")
+        items = session.exec(statement).all()
+        for item in items:
+            item.status = "pending"
+            session.add(item)
+    session.commit()
+
+def reset_processed_items(session: Session, item_type: str):
+    """Reset status of processed posts or comments back to pending and remove their annotations"""
+    if item_type == "post":
+        posts_stmt = select(Post).where(Post.status == "processed")
+        posts = session.exec(posts_stmt).all()
+        for p in posts:
+            p.status = "pending"
+            session.add(p)
+            ann = session.get(Annotation, p.id)
+            if ann:
+                session.delete(ann)
+    elif item_type == "comment":
+        comments_stmt = select(Comment).where(Comment.status == "processed")
+        comments = session.exec(comments_stmt).all()
+        for c in comments:
+            c.status = "pending"
+            session.add(c)
+            ann = session.get(Annotation, c.id)
+            if ann:
+                session.delete(ann)
+    session.commit()
+
+def clear_stage_2_clustering(session: Session):
+    """Wipe cluster assignments and consolidated tags from all annotations"""
+    statement = select(Annotation)
+    annotations = session.exec(statement).all()
+    for ann in annotations:
+        ann.cluster_id = None
+        ann.consolidated_tag = None
+        session.add(ann)
+    session.commit()
+
+def reset_specific_items(session: Session, item_ids: List[str]):
+    """Reset specific posts or comments by ID back to pending and remove annotations if present"""
+    for item_id in item_ids:
+        post = session.get(Post, item_id)
+        if post:
+            post.status = "pending"
+            session.add(post)
+            ann = session.get(Annotation, item_id)
+            if ann:
+                session.delete(ann)
+        comment = session.get(Comment, item_id)
+        if comment:
+            comment.status = "pending"
+            session.add(comment)
+            ann = session.get(Annotation, item_id)
+            if ann:
+                session.delete(ann)
+    session.commit()
+
+def nuke_database(session: Session):
+    """Delete all rows from all tables"""
+    from sqlmodel import delete
+    session.exec(delete(Annotation))
+    session.exec(delete(Comment))
+    session.exec(delete(Post))
     session.commit()
 
 def get_statistics(session: Session) -> dict:
