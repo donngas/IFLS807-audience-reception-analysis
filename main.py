@@ -13,6 +13,244 @@ def default_export_path(kind: str, extension: str, directory: str = ".") -> str:
     filename = f"{get_workspace_stem()}_{kind}.{extension.lstrip('.')}"
     return os.path.join(directory, filename) if directory and directory != "." else filename
 
+
+def configure_scrape_job():
+    print("\n=== Reddit Query Setup ===")
+    query_method = questionary.select(
+        "How would you like to enter your search query?",
+        choices=[
+            "1. Enter query directly (for experienced users)",
+            "2. Use Interactive Query Builder (helper wizard)",
+            "3. Read Reddit Search Syntax Guide"
+        ]
+    ).ask()
+
+    if not query_method:
+        return None
+
+    query = ""
+    if query_method.startswith("3"):
+        print("\n" + "="*50)
+        print("REDDIT SEARCH QUERY SYNTAX GUIDE")
+        print("="*50)
+        print("Reddit search supports Boolean operators (must be UPPERCASE):")
+        print("  - AND: Matches both terms (e.g. 'Jake AND Amy')")
+        print("  - OR: Matches either term (e.g. 'chemistry OR romance')")
+        print("  - NOT: Excludes terms (e.g. 'chemistry NOT physics')")
+        print("Grouping and exact matches:")
+        print("  - Parentheses: Group operators (e.g. '(Jake AND Amy) AND (chemistry OR pacing)')")
+        print("  - Quotes: Match exact phrase (e.g. '\"pacing issues\"')")
+        print("Field searches:")
+        print("  - title: Search titles only (e.g. 'title:\"WandaVision\"')")
+        print("  - author: Search by author (e.g. 'author:AutoModerator')")
+        print("="*50 + "\n")
+
+        query = questionary.text("Enter search query (e.g. {Jake AND Amy}):").ask()
+    elif query_method.startswith("2"):
+        print("\n--- Interactive Query Builder ---")
+        primary = questionary.text("Enter primary search terms (must match all, e.g., Jake, Amy):").ask()
+        optional = questionary.text("Enter optional terms (matches any of these, e.g., chemistry, romance, pacing - leave blank if none):").ask()
+        exclude = questionary.text("Enter terms to exclude (leave blank if none):").ask()
+
+        parts = []
+        if primary:
+            primary_terms = [t.strip() for t in primary.split(",") if t.strip()]
+            if len(primary_terms) > 1:
+                parts.append("(" + " AND ".join(primary_terms) + ")")
+            else:
+                parts.append(primary_terms[0])
+
+        if optional:
+            optional_terms = [t.strip() for t in optional.split(",") if t.strip()]
+            if len(optional_terms) > 1:
+                parts.append("(" + " OR ".join(optional_terms) + ")")
+            else:
+                parts.append(optional_terms[0])
+
+        exclude_part = ""
+        if exclude:
+            exclude_terms = [t.strip() for t in exclude.split(",") if t.strip()]
+            if len(exclude_terms) > 1:
+                exclude_part = "NOT (" + " OR ".join(exclude_terms) + ")"
+            else:
+                exclude_part = f"NOT {exclude_terms[0]}"
+
+        query = " AND ".join(parts)
+        if exclude_part:
+            query = f"{query} {exclude_part}" if query else exclude_part
+
+        print(f"\nGenerated Query: {query}")
+        confirm_query = questionary.confirm("Use this generated query?", default=True).ask()
+        if not confirm_query:
+            return None
+    else:
+        query = questionary.text("Enter search query (e.g. {Jake AND Amy}):").ask()
+
+    if not query:
+        return None
+
+    sub_str = questionary.text("Enter subreddits (comma-separated, leave blank for all):").ask()
+    sub_list = [s.strip() for s in sub_str.split(",")] if sub_str else None
+
+    p_limit = int(questionary.text("Post limit:", default="50").ask() or "50")
+    c_limit = int(questionary.text("Comment limit per post:", default="25").ask() or "25")
+
+    method_choice = questionary.select(
+        "Select data acquisition method:",
+        choices=[
+            "1. PRAW (Reddit API - requires credentials)",
+            "2. Unauthenticated JSON (Bypass API keys)",
+            "3. Playwright (Direct headless browser scraping)"
+        ],
+        default="1. PRAW (Reddit API - requires credentials)"
+    ).ask()
+    if not method_choice:
+        return None
+    method_val = "praw" if "PRAW" in method_choice else ("playwright" if "Playwright" in method_choice else "json")
+
+    sort_val = "top"
+    time_val = "all"
+    skip_val = True
+    fill_post_limit_val = True
+    adv = questionary.confirm("Configure advanced scraping options?", default=False).ask()
+    if adv:
+        sort_val = questionary.select("Sort by:", choices=["top", "hot", "new", "relevance"], default="top").ask() or "top"
+        time_val = questionary.select("Time filter:", choices=["all", "day", "week", "month", "year"], default="all").ask() or "all"
+        skip_val = questionary.confirm("Skip already scraped posts?", default=True).ask()
+        fill_post_limit_val = questionary.confirm("Keep fetching until post limit is reached with usable saved posts?", default=True).ask()
+
+    return {
+        "type": "scrape",
+        "query": query,
+        "subreddits": sub_list,
+        "post_limit": p_limit,
+        "comment_limit": c_limit,
+        "sort": sort_val,
+        "time_filter": time_val,
+        "skip_existing": bool(skip_val),
+        "method": method_val,
+        "fill_post_limit": bool(fill_post_limit_val),
+    }
+
+
+def configure_stage_1_job():
+    model_val = None
+    temp_val = 0.1
+    concurrency_val = 10
+    force_val = False
+    adv = questionary.confirm("Configure advanced Stage 1 options?", default=False).ask()
+    if adv:
+        model_val = questionary.text("OpenRouter Model:", default="google/gemma-4-26b-a4b-it").ask()
+        temp_val = float(questionary.text("LLM Temperature:", default="0.1").ask() or "0.1")
+        concurrency_val = int(questionary.text("Concurrent OpenRouter requests:", default="10").ask() or "10")
+        force_val = questionary.confirm("Force re-analyze already processed items?", default=False).ask()
+
+    return {
+        "type": "stage1",
+        "model_name": model_val,
+        "temperature": temp_val,
+        "force_reanalyze": bool(force_val),
+        "concurrency": concurrency_val,
+    }
+
+
+def configure_stage_2_job():
+    embed_val = "sentence-transformers/all-minilm-l12-v2"
+    label_val = "google/gemma-4-26b-a4b-it"
+    min_size_val = 5
+    force_embed_val = False
+    force_cluster_val = False
+    sample_val = 15
+    concurrency_val = 10
+
+    adv = questionary.confirm("Configure advanced Stage 2 options?", default=False).ask()
+    if adv:
+        embed_val = questionary.text("Embedding Model:", default=embed_val).ask() or embed_val
+        label_val = questionary.text("Labeling Model:", default=label_val).ask() or label_val
+        min_size_val = int(questionary.text("HDBSCAN min_cluster_size:", default=str(min_size_val)).ask() or str(min_size_val))
+        force_embed_val = questionary.confirm("Force re-generate embeddings (bypass cache)?", default=False).ask()
+        force_cluster_val = questionary.confirm("Force re-run clustering and LLM labeling?", default=False).ask()
+        sample_val = int(questionary.text("Representative items per cluster for labeling:", default=str(sample_val)).ask() or str(sample_val))
+        concurrency_val = int(questionary.text("Concurrent OpenRouter requests:", default=str(concurrency_val)).ask() or str(concurrency_val))
+
+    return {
+        "type": "stage2",
+        "embedding_model": embed_val,
+        "labeling_model": label_val,
+        "min_cluster_size": min_size_val,
+        "force_reembed": bool(force_embed_val),
+        "force_recluster": bool(force_cluster_val),
+        "label_sample_size": sample_val,
+        "concurrency": concurrency_val,
+    }
+
+
+def run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analysis):
+    if job["type"] == "scrape":
+        print("Starting Reddit acquisition...")
+        scrape_reddit(
+            job["query"],
+            job["subreddits"],
+            job["post_limit"],
+            job["comment_limit"],
+            sort=job["sort"],
+            time_filter=job["time_filter"],
+            skip_existing=job["skip_existing"],
+            method=job["method"],
+            fill_post_limit=job["fill_post_limit"],
+        )
+    elif job["type"] == "stage1":
+        print("Starting Stage 1 Analysis (Feature Extraction)...")
+        run_stage_1_analysis(
+            model_name=job["model_name"],
+            temperature=job["temperature"],
+            force_reanalyze=job["force_reanalyze"],
+            concurrency=job["concurrency"],
+        )
+    elif job["type"] == "stage2":
+        print("Starting Stage 2 Analysis (Thematic Clustering)...")
+        run_stage_2_analysis(
+            embedding_model=job["embedding_model"],
+            labeling_model=job["labeling_model"],
+            min_cluster_size=job["min_cluster_size"],
+            force_reembed=job["force_reembed"],
+            force_recluster=job["force_recluster"],
+            label_sample_size=job["label_sample_size"],
+            concurrency=job["concurrency"],
+        )
+
+
+def configure_pipeline_jobs():
+    choices = [
+        "1. Scrape Reddit posts & comments",
+        "2. Run Stage 1 Analysis (Sentiment & Tags)",
+        "3. Run Stage 2 Analysis (Embedding & HDBSCAN Clustering)",
+    ]
+    selected = questionary.checkbox(
+        "Select pipeline jobs to configure now and run sequentially:",
+        choices=choices,
+    ).ask()
+
+    if not selected:
+        return []
+
+    jobs = []
+    for choice in choices:
+        if choice not in selected:
+            continue
+        print(f"\n--- Configure {choice} ---")
+        if choice.startswith("1"):
+            job = configure_scrape_job()
+        elif choice.startswith("2"):
+            job = configure_stage_1_job()
+        else:
+            job = configure_stage_2_job()
+        if job is None:
+            print("Batch setup cancelled before any jobs were run.")
+            return []
+        jobs.append(job)
+    return jobs
+
 def main():
     load_dotenv()
     
@@ -155,180 +393,47 @@ def run_interactive_wizard():
                 "1. Scrape Reddit posts & comments",
                 "2. Run Stage 1 Analysis (Sentiment & Tags)",
                 "3. Run Stage 2 Analysis (Embedding & HDBSCAN Clustering)",
-                "4. View Database Records & Stats",
-                "5. Manage / Reset Database Records",
-                "6. Export data to CSV/JSON",
-                "7. Run Visualizations & Dashboards",
-                "8. Exit"
+                "4. Run multiple pipeline jobs",
+                "5. View Database Records & Stats",
+                "6. Manage / Reset Database Records",
+                "7. Export data to CSV/JSON",
+                "8. Run Visualizations & Dashboards",
+                "9. Exit"
             ]
         ).ask()
         
-        if not choice or choice.startswith("8"):
+        if not choice or choice.startswith("9"):
             print("Exiting pipeline. Goodbye!")
             break
             
         if choice.startswith("1"):
-            print("\n=== Reddit Query Setup ===")
-            query_method = questionary.select(
-                "How would you like to enter your search query?",
-                choices=[
-                    "1. Enter query directly (for experienced users)",
-                    "2. Use Interactive Query Builder (helper wizard)",
-                    "3. Read Reddit Search Syntax Guide"
-                ]
-            ).ask()
-            
-            if not query_method:
-                continue
-                
-            query = ""
-            if query_method.startswith("3"):
-                print("\n" + "="*50)
-                print("REDDIT SEARCH QUERY SYNTAX GUIDE")
-                print("="*50)
-                print("Reddit search supports Boolean operators (must be UPPERCASE):")
-                print("  - AND: Matches both terms (e.g. 'Jake AND Amy')")
-                print("  - OR: Matches either term (e.g. 'chemistry OR romance')")
-                print("  - NOT: Excludes terms (e.g. 'chemistry NOT physics')")
-                print("Grouping and exact matches:")
-                print("  - Parentheses: Group operators (e.g. '(Jake AND Amy) AND (chemistry OR pacing)')")
-                print("  - Quotes: Match exact phrase (e.g. '\"pacing issues\"')")
-                print("Field searches:")
-                print("  - title: Search titles only (e.g. 'title:\"WandaVision\"')")
-                print("  - author: Search by author (e.g. 'author:AutoModerator')")
-                print("="*50 + "\n")
-                
-                query = questionary.text("Enter search query (e.g. {Jake AND Amy}):").ask()
-            elif query_method.startswith("2"):
-                # Interactive Query Builder
-                print("\n--- Interactive Query Builder ---")
-                primary = questionary.text("Enter primary search terms (must match all, e.g., Jake, Amy):").ask()
-                optional = questionary.text("Enter optional terms (matches any of these, e.g., chemistry, romance, pacing - leave blank if none):").ask()
-                exclude = questionary.text("Enter terms to exclude (leave blank if none):").ask()
-                
-                parts = []
-                if primary:
-                    primary_terms = [t.strip() for t in primary.split(",") if t.strip()]
-                    if len(primary_terms) > 1:
-                        parts.append("(" + " AND ".join(primary_terms) + ")")
-                    else:
-                        parts.append(primary_terms[0])
-                        
-                if optional:
-                    optional_terms = [t.strip() for t in optional.split(",") if t.strip()]
-                    if len(optional_terms) > 1:
-                        parts.append("(" + " OR ".join(optional_terms) + ")")
-                    else:
-                        parts.append(optional_terms[0])
-                        
-                exclude_part = ""
-                if exclude:
-                    exclude_terms = [t.strip() for t in exclude.split(",") if t.strip()]
-                    if len(exclude_terms) > 1:
-                        exclude_part = "NOT (" + " OR ".join(exclude_terms) + ")"
-                    else:
-                        exclude_part = f"NOT {exclude_terms[0]}"
-                
-                query = " AND ".join(parts)
-                if exclude_part:
-                    query = f"{query} {exclude_part}" if query else exclude_part
-                    
-                print(f"\nGenerated Query: {query}")
-                confirm_query = questionary.confirm("Use this generated query?", default=True).ask()
-                if not confirm_query:
-                    continue
-            else:
-                query = questionary.text("Enter search query (e.g. {Jake AND Amy}):").ask()
-                
-            if not query:
-                continue
-                
-            sub_str = questionary.text("Enter subreddits (comma-separated, leave blank for all):").ask()
-            sub_list = [s.strip() for s in sub_str.split(",")] if sub_str else None
-            
-            p_limit = questionary.text("Post limit:", default="50").ask()
-            c_limit = questionary.text("Comment limit per post:", default="25").ask()
-            
-            # Data Acquisition Method Choice
-            method_choice = questionary.select(
-                "Select data acquisition method:",
-                choices=[
-                    "1. PRAW (Reddit API - requires credentials)",
-                    "2. Unauthenticated JSON (Bypass API keys)",
-                    "3. Playwright (Direct headless browser scraping)"
-                ],
-                default="1. PRAW (Reddit API - requires credentials)"
-            ).ask()
-            method_val = "praw" if "PRAW" in method_choice else ("playwright" if "Playwright" in method_choice else "json")
-            
-            # Advanced Scraping Options
-            sort_val = "top"
-            time_val = "all"
-            skip_val = True
-            fill_post_limit_val = True
-            adv = questionary.confirm("Configure advanced scraping options?", default=False).ask()
-            if adv:
-                sort_val = questionary.select("Sort by:", choices=["top", "hot", "new", "relevance"], default="top").ask()
-                time_val = questionary.select("Time filter:", choices=["all", "day", "week", "month", "year"], default="all").ask()
-                skip_val = questionary.confirm("Skip already scraped posts?", default=True).ask()
-                fill_post_limit_val = questionary.confirm("Keep fetching until post limit is reached with usable saved posts?", default=True).ask()
-                
-            scrape_reddit(query, sub_list, int(p_limit), int(c_limit), sort=sort_val, time_filter=time_val, skip_existing=skip_val, method=method_val, fill_post_limit=fill_post_limit_val)
+            job = configure_scrape_job()
+            if job:
+                run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analysis)
             
         elif choice.startswith("2"):
-            # Default or Advanced Stage 1
-            model_val = None
-            temp_val = 0.1
-            concurrency_val = 10
-            force_val = False
-            adv = questionary.confirm("Configure advanced Stage 1 options?", default=False).ask()
-            if adv:
-                model_val = questionary.text("OpenRouter Model:", default="google/gemma-4-26b-a4b-it").ask()
-                temp_val = float(questionary.text("LLM Temperature:", default="0.1").ask())
-                concurrency_val = int(questionary.text("Concurrent OpenRouter requests:", default="10").ask())
-                force_val = questionary.confirm("Force re-analyze already processed items?", default=False).ask()
-                
-            print("Starting Stage 1 Analysis (Feature Extraction)...")
-            run_stage_1_analysis(model_name=model_val, temperature=temp_val, force_reanalyze=force_val, concurrency=concurrency_val)
+            job = configure_stage_1_job()
+            run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analysis)
             
         elif choice.startswith("3"):
-            # Default or Advanced Stage 2
-            embed_val = "sentence-transformers/all-minilm-l12-v2"
-            label_val = "google/gemma-4-26b-a4b-it"
-            min_size_val = 5
-            force_embed_val = False
-            force_cluster_val = False
-            sample_val = 15
-            concurrency_val = 10
-            
-            adv = questionary.confirm("Configure advanced Stage 2 options?", default=False).ask()
-            if adv:
-                embed_val = questionary.text("Embedding Model:", default=embed_val).ask()
-                label_val = questionary.text("Labeling Model:", default=label_val).ask()
-                min_size_val = int(questionary.text("HDBSCAN min_cluster_size:", default=str(min_size_val)).ask())
-                force_embed_val = questionary.confirm("Force re-generate embeddings (bypass cache)?", default=False).ask()
-                force_cluster_val = questionary.confirm("Force re-run clustering and LLM labeling?", default=False).ask()
-                sample_val = int(questionary.text("Representative items per cluster for labeling:", default=str(sample_val)).ask())
-                concurrency_val = int(questionary.text("Concurrent OpenRouter requests:", default=str(concurrency_val)).ask())
-                
-            print("Starting Stage 2 Analysis (Thematic Clustering)...")
-            run_stage_2_analysis(
-                embedding_model=embed_val,
-                labeling_model=label_val,
-                min_cluster_size=min_size_val,
-                force_reembed=force_embed_val,
-                force_recluster=force_cluster_val,
-                label_sample_size=sample_val,
-                concurrency=concurrency_val
-            )
+            job = configure_stage_2_job()
+            run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analysis)
              
         elif choice.startswith("4"):
+            jobs = configure_pipeline_jobs()
+            for index, job in enumerate(jobs, 1):
+                print(f"\n=== Running selected job {index}/{len(jobs)} ===")
+                run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analysis)
+            if jobs:
+                print("\nSelected pipeline jobs completed.")
+             
+        elif choice.startswith("5"):
             run_interactive_db_viewer()
             
-        elif choice.startswith("5"):
+        elif choice.startswith("6"):
             run_db_management_submenu()
             
-        elif choice.startswith("6"):
+        elif choice.startswith("7"):
             fmt = questionary.select("Select export format:", choices=["csv", "json"]).ask()
             if not fmt:
                 continue
@@ -343,7 +448,7 @@ def run_interactive_wizard():
             else:
                 export_to_json(out_path)
                 
-        elif choice.startswith("7"):
+        elif choice.startswith("8"):
             run_visualization_submenu()
 
 def run_db_management_submenu():
@@ -730,6 +835,8 @@ def manipulate_item(session, item, item_type):
         if ann:
             print(f"  Sentiment:        {ann.sentiment}")
             print(f"  Raw Tag:          {ann.raw_tag}")
+            print(f"  Substantive:      {'Yes' if ann.is_substantive else 'No'}")
+            print(f"  Reception Reason: {ann.reception_reason or 'N/A'}")
             print(f"  Consolidated Tag: {ann.consolidated_tag}")
             print(f"  Cluster Why:      {ann.cluster_explanation or 'N/A'}")
             print(f"  Cluster ID:       {ann.cluster_id}")
@@ -769,7 +876,12 @@ def manipulate_item(session, item, item_type):
                 choices=["-1.0", "-0.5", "0.0", "0.5", "1.0"],
                 default=str(ann.sentiment) if ann else "0.0"
             ).ask() or 0.0)
+            new_is_substantive = questionary.confirm("Is this a substantive reception reason?", default=ann.is_substantive if ann else True).ask()
             new_raw_tag = questionary.text("Enter Raw Tag:", default=ann.raw_tag if ann else "").ask() or "Reaction Only"
+            new_reception_reason = questionary.text("Enter Reception Reason:", default=ann.reception_reason if ann and ann.reception_reason else "").ask() or ""
+            if not new_is_substantive:
+                new_raw_tag = "Reaction Only"
+                new_reception_reason = ""
             new_consolidated = questionary.text("Enter Consolidated Tag (Theme):", default=ann.consolidated_tag if ann else "").ask() or ""
             new_explanation = questionary.text("Enter Cluster Explanation:", default=ann.cluster_explanation if ann and ann.cluster_explanation else "").ask() or ""
             
@@ -779,6 +891,8 @@ def manipulate_item(session, item, item_type):
                     item_type=item_type,
                     sentiment=new_sentiment,
                     raw_tag=new_raw_tag,
+                    is_substantive=bool(new_is_substantive),
+                    reception_reason=new_reception_reason or None,
                     consolidated_tag=new_consolidated or None,
                     cluster_explanation=new_explanation or None,
                     summary="Manually annotated"
@@ -786,6 +900,8 @@ def manipulate_item(session, item, item_type):
             else:
                 ann.sentiment = new_sentiment
                 ann.raw_tag = new_raw_tag
+                ann.is_substantive = bool(new_is_substantive)
+                ann.reception_reason = new_reception_reason or None
                 ann.consolidated_tag = new_consolidated or None
                 ann.cluster_explanation = new_explanation or None
                 ann.summary = ann.summary or "Manually edited"
@@ -855,7 +971,12 @@ def manipulate_items_bulk(session, items, item_type):
             choices=["-1.0", "-0.5", "0.0", "0.5", "1.0"],
             default="0.0"
         ).ask() or 0.0)
+        new_is_substantive = questionary.confirm("Are these substantive reception reasons?", default=True).ask()
         new_raw_tag = questionary.text("Enter Raw Tag:").ask() or "Reaction Only"
+        new_reception_reason = questionary.text("Enter Reception Reason (leave blank if none):").ask() or ""
+        if not new_is_substantive:
+            new_raw_tag = "Reaction Only"
+            new_reception_reason = ""
         new_consolidated = questionary.text("Enter Consolidated Tag (Theme - leave blank if none):").ask() or ""
         new_explanation = questionary.text("Enter Cluster Explanation (leave blank if none):").ask() or ""
         
@@ -868,6 +989,8 @@ def manipulate_items_bulk(session, items, item_type):
                     item_type=item_type,
                     sentiment=new_sentiment,
                     raw_tag=new_raw_tag,
+                    is_substantive=bool(new_is_substantive),
+                    reception_reason=new_reception_reason or None,
                     consolidated_tag=new_consolidated or None,
                     cluster_explanation=new_explanation or None,
                     summary="Bulk manually annotated"
@@ -875,6 +998,8 @@ def manipulate_items_bulk(session, items, item_type):
             else:
                 ann.sentiment = new_sentiment
                 ann.raw_tag = new_raw_tag
+                ann.is_substantive = bool(new_is_substantive)
+                ann.reception_reason = new_reception_reason or None
                 ann.consolidated_tag = new_consolidated or None
                 ann.cluster_explanation = new_explanation or None
                 ann.summary = "Bulk manually edited"
