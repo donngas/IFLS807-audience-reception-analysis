@@ -71,17 +71,18 @@ def main():
     # Scrape args
     parser.add_argument("--query", type=str, help="Search query for Reddit")
     parser.add_argument("--subreddits", type=str, help="Comma-separated list of subreddits")
-    parser.add_argument("--post-limit", type=int, default=100, help="Max posts to scrape")
-    parser.add_argument("--comment-limit", type=int, default=100, help="Max comments per post to scrape")
+    parser.add_argument("--post-limit", type=int, default=50, help="Target posts to scrape")
+    parser.add_argument("--comment-limit", type=int, default=50, help="Max comments per post to scrape")
     parser.add_argument("--sort", type=str, default="top", help="Reddit search sort")
     parser.add_argument("--time-filter", type=str, default="all", help="Reddit search time filter")
     parser.add_argument("--force-overwrite", action="store_true", help="Force overwrite existing scraped items")
     parser.add_argument("--method", choices=["praw", "json", "playwright"], default="praw", help="Data acquisition method (praw, json, or playwright)")
+    parser.add_argument("--fill-post-limit", action=argparse.BooleanOptionalAction, default=True, help="Keep fetching until post limit is reached with usable saved posts")
     
     # Stage 1 args
     parser.add_argument("--model", type=str, help="OpenRouter model name")
-    parser.add_argument("--batch-limit", type=int, default=100, help="Max items to process in Stage 1")
     parser.add_argument("--temp", type=float, default=0.1, help="Model temperature")
+    parser.add_argument("--stage1-concurrency", type=int, default=5, help="Concurrent OpenRouter requests for Stage 1")
     parser.add_argument("--force-reanalyze", action="store_true", help="Force re-analyze processed items")
     
     # Stage 2 args
@@ -107,11 +108,11 @@ def main():
             print("Error: --query is required for scrape action.")
             return
         sub_list = [s.strip() for s in args.subreddits.split(",")] if args.subreddits else None
-        scrape_reddit(args.query, sub_list, args.post_limit, args.comment_limit, sort=args.sort, time_filter=args.time_filter, skip_existing=not args.force_overwrite, method=args.method)
+        scrape_reddit(args.query, sub_list, args.post_limit, args.comment_limit, sort=args.sort, time_filter=args.time_filter, skip_existing=not args.force_overwrite, method=args.method, fill_post_limit=args.fill_post_limit)
         
     elif args.action == "analyze":
         print("Starting Stage 1 Analysis (Feature Extraction)...")
-        run_stage_1_analysis(model_name=args.model, limit=args.batch_limit, temperature=args.temp, force_reanalyze=args.force_reanalyze)
+        run_stage_1_analysis(model_name=args.model, temperature=args.temp, force_reanalyze=args.force_reanalyze, concurrency=args.stage1_concurrency)
         
     elif args.action == "cluster":
         print("Starting Stage 2 Analysis (Semantic Embedding Clustering)...")
@@ -237,8 +238,8 @@ def run_interactive_wizard():
             sub_str = questionary.text("Enter subreddits (comma-separated, leave blank for all):").ask()
             sub_list = [s.strip() for s in sub_str.split(",")] if sub_str else None
             
-            p_limit = questionary.text("Post limit:", default="100").ask()
-            c_limit = questionary.text("Comment limit per post:", default="100").ask()
+            p_limit = questionary.text("Post limit:", default="50").ask()
+            c_limit = questionary.text("Comment limit per post:", default="50").ask()
             
             # Data Acquisition Method Choice
             method_choice = questionary.select(
@@ -256,29 +257,31 @@ def run_interactive_wizard():
             sort_val = "top"
             time_val = "all"
             skip_val = True
+            fill_post_limit_val = True
             adv = questionary.confirm("Configure advanced scraping options?", default=False).ask()
             if adv:
                 sort_val = questionary.select("Sort by:", choices=["top", "hot", "new", "relevance"], default="top").ask()
                 time_val = questionary.select("Time filter:", choices=["all", "day", "week", "month", "year"], default="all").ask()
                 skip_val = questionary.confirm("Skip already scraped posts?", default=True).ask()
+                fill_post_limit_val = questionary.confirm("Keep fetching until post limit is reached with usable saved posts?", default=True).ask()
                 
-            scrape_reddit(query, sub_list, int(p_limit), int(c_limit), sort=sort_val, time_filter=time_val, skip_existing=skip_val, method=method_val)
+            scrape_reddit(query, sub_list, int(p_limit), int(c_limit), sort=sort_val, time_filter=time_val, skip_existing=skip_val, method=method_val, fill_post_limit=fill_post_limit_val)
             
         elif choice.startswith("2"):
             # Default or Advanced Stage 1
             model_val = None
-            limit_val = 100
             temp_val = 0.1
+            concurrency_val = 5
             force_val = False
             adv = questionary.confirm("Configure advanced Stage 1 options?", default=False).ask()
             if adv:
                 model_val = questionary.text("OpenRouter Model:", default="google/gemma-4-26b-a4b-it").ask()
-                limit_val = int(questionary.text("Batch limit (max items to process):", default="100").ask())
                 temp_val = float(questionary.text("LLM Temperature:", default="0.1").ask())
+                concurrency_val = int(questionary.text("Concurrent OpenRouter requests:", default="5").ask())
                 force_val = questionary.confirm("Force re-analyze already processed items?", default=False).ask()
                 
             print("Starting Stage 1 Analysis (Feature Extraction)...")
-            run_stage_1_analysis(model_name=model_val, limit=limit_val, temperature=temp_val, force_reanalyze=force_val)
+            run_stage_1_analysis(model_name=model_val, temperature=temp_val, force_reanalyze=force_val, concurrency=concurrency_val)
             
         elif choice.startswith("3"):
             # Default or Advanced Stage 2

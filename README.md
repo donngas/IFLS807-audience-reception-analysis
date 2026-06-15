@@ -99,7 +99,7 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 - Queries designated subreddits using Reddit's search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
 - **Query Translation**: Since custom queries might be entered using curly braces (e.g. `{Jake AND Amy}`), the scraper automatically normalizes these to standard parenthetical expressions (e.g. `(Jake AND Amy)`) before sending them to PRAW.
 - **Ordering**: Results are sorted by configurable parameters (such as `top`, `hot`, `new`, `relevance`) with a time filter (such as `all`, `year`, `month`, `week`, `day`).
-- **Scrape Volume**: Scrapes approximately 100 posts per query and up to 100 top-level comments per post.
+- **Scrape Volume**: Scrapes 50 usable posts per query by default and up to 50 top-level comments per post. By default, acquisition keeps fetching additional search results until the saved usable posts reach the requested post limit, when enough results are available. Use `--no-fill-post-limit` to treat the post limit as the number of search candidates to try instead.
 - **Filtering Noise**: Automatically ignores or marks as `skipped` on scraping:
   - Comments where the body is `"[deleted]"` or `"[removed]"`
   - Comments authored by `"AutoModerator"` (or other common bots)
@@ -108,12 +108,12 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 
 ### 2. Stage 1: Feature Extraction (`analyzer.py`)
 
-- Performs LLM inference on individual posts and top-level comments marked as `pending`.
+- Performs concurrent LLM inference on all posts and top-level comments marked as `pending`.
 - Queries OpenRouter models (e.g. `google/gemma-4-26b-a4b-it`) to retrieve structured JSON. Enforces JSON schemas using Pydantic models.
 - Structured JSON fields:
   - **sentiment**: A discrete numeric score representing sentiment polarity, restricted to exactly: `[-1.0, -0.5, 0.0, 0.5, 1.0]` (Strongly Negative, Negative, Neutral/Mixed, Positive, Strongly Positive).
   - **summary**: A concise 1-2 sentence summarization.
-  - **raw_tag**: A single primary descriptive tag (1-3 words in length, e.g., `"chemistry"`, `"pacing issues"`, `"rushed writing"`). If the content has no meaningful theme (e.g., simple memes, expressions, or low-substance content), the model returns `"Reaction Only"`.
+  - **raw_tag**: A single primary descriptive tag (typically 2-5 words, e.g., `"earned emotional payoff"`, `"forced conflict writing"`, `"chemistry through banter"`). If the content has no meaningful theme (e.g., simple memes, expressions, or low-substance content), the model returns `"Reaction Only"`.
 - **Substance Check Guideline**: The LLM prompt contains a gentle guideline suggesting that if a post/comment contains less than 15 characters or lacks analytical substance, it should be categorized with `"Reaction Only"` as the tag.
 - On success, updates the item's status to `processed`. On repeated failures, sets status to `failed`.
 

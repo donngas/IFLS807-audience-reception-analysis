@@ -4,10 +4,13 @@ import urllib.request
 import urllib.parse
 import json
 import praw
+from itertools import chain
 from praw.models import Submission
-from typing import List, Optional
+from typing import Callable, Iterable, List, Optional
 from tqdm import tqdm
 from database import Session, engine, Post, Comment, upsert_post, upsert_comment
+
+REDDIT_JSON_PAGE_LIMIT = 100
 
 def get_praw_reddit():
     client_id = os.environ.get("REDDIT_CLIENT_ID")
@@ -65,7 +68,8 @@ def build_pullpush_url(
     limit: int,
     subreddit: Optional[str] = None,
     sort: str = "top",
-    time_filter: str = "all"
+    time_filter: str = "all",
+    before: Optional[int] = None
 ) -> str:
     """Build a PullPush API URL with proper sort and time filter translation.
     
@@ -109,37 +113,144 @@ def build_pullpush_url(
         after_epoch = int(_time.time()) - time_offsets[time_filter]
         pp_url += f"&after={after_epoch}"
     # "all" -> no 'after' constraint
+
+    if before:
+        pp_url += f"&before={before}"
     
     return pp_url
+
+
+def build_reddit_search_url(
+    translated_query: str,
+    subreddits: Optional[List[str]],
+    sort: str,
+    time_filter: str,
+    limit: int,
+    after: Optional[str] = None,
+) -> str:
+    params = {
+        "q": translated_query,
+        "sort": sort,
+        "t": time_filter,
+        "limit": str(limit),
+    }
+    if after:
+        params["after"] = after
+
+    encoded_params = urllib.parse.urlencode(params)
+    if subreddits and len(subreddits) > 0:
+        subreddit_str = "+".join([s.strip() for s in subreddits])
+        return f"https://www.reddit.com/r/{subreddit_str}/search.json?{encoded_params}"
+    return f"https://www.reddit.com/search.json?{encoded_params}"
+
+
+def extract_reddit_posts(payload: dict) -> tuple[List[dict], Optional[str]]:
+    data = payload.get("data", {})
+    raw_children = data.get("children", [])
+    posts = [child.get("data", {}) for child in raw_children]
+    return posts, data.get("after")
+
+
+def reddit_search_batches(
+    fetch_payload: Callable[[str], dict],
+    translated_query: str,
+    subreddits: Optional[List[str]],
+    post_limit: int,
+    sort: str,
+    time_filter: str,
+    fill_post_limit: bool,
+) -> Iterable[List[dict]]:
+    after = None
+    seen_after = set()
+    page_limit = min(REDDIT_JSON_PAGE_LIMIT, max(1, post_limit))
+
+    while True:
+        limit = page_limit if fill_post_limit else post_limit
+        url = build_reddit_search_url(translated_query, subreddits, sort, time_filter, limit, after)
+        payload = fetch_payload(url)
+        posts, next_after = extract_reddit_posts(payload)
+        yield posts
+
+        if not fill_post_limit or not posts or not next_after or next_after in seen_after:
+            break
+        seen_after.add(next_after)
+        after = next_after
+
+
+def pullpush_search_batches(
+    encoded_query: str,
+    subreddits: Optional[List[str]],
+    post_limit: int,
+    sort: str,
+    time_filter: str,
+    fill_post_limit: bool,
+) -> Iterable[List[dict]]:
+    subs = subreddits if subreddits else [None]
+    page_limit = min(REDDIT_JSON_PAGE_LIMIT, max(1, post_limit))
+
+    for sub in subs:
+        before = None
+        while True:
+            limit = page_limit if fill_post_limit else post_limit
+            pp_url = build_pullpush_url(
+                "submission",
+                encoded_query,
+                limit,
+                subreddit=sub,
+                sort=sort,
+                time_filter=time_filter,
+                before=before,
+            )
+            print(f"  Querying PullPush: {pp_url}")
+            try:
+                payload = fetch_json(pp_url, use_impersonation=False)
+                returned_data = payload.get("data", [])
+                print(f"  PullPush API returned {len(returned_data)} submissions.")
+                yield returned_data
+            except Exception as e:
+                print(f"  PullPush failed for subreddit {sub}: {e}")
+                break
+
+            if not fill_post_limit or not returned_data:
+                break
+            created_values = [p.get("created_utc") for p in returned_data if p.get("created_utc")]
+            if not created_values:
+                break
+            next_before = int(min(created_values))
+            if before == next_before:
+                break
+            before = next_before
 
 def scrape_reddit(
     query: str, 
     subreddits: Optional[List[str]] = None, 
-    post_limit: int = 100, 
-    comment_limit: int = 100, 
+    post_limit: int = 50, 
+    comment_limit: int = 50, 
     sort: str = "top", 
     time_filter: str = "all", 
     skip_existing: bool = True,
-    method: str = "praw"
+    method: str = "praw",
+    fill_post_limit: bool = True
 ):
     """Orchestrate scraping using either PRAW, unauthenticated JSON, or Playwright directly."""
     if method == "praw":
-        scrape_reddit_praw(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing)
+        scrape_reddit_praw(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing, fill_post_limit)
     elif method == "json":
-        scrape_reddit_json(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing)
+        scrape_reddit_json(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing, fill_post_limit)
     elif method == "playwright":
-        scrape_reddit_playwright(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing)
+        scrape_reddit_playwright(query, subreddits, post_limit, comment_limit, sort, time_filter, skip_existing, fill_post_limit)
     else:
         raise ValueError(f"Unknown data acquisition method: {method}")
 
 def scrape_reddit_praw(
     query: str, 
     subreddits: Optional[List[str]] = None, 
-    post_limit: int = 100, 
-    comment_limit: int = 100, 
+    post_limit: int = 50, 
+    comment_limit: int = 50, 
     sort: str = "top", 
     time_filter: str = "all", 
-    skip_existing: bool = True
+    skip_existing: bool = True,
+    fill_post_limit: bool = True
 ):
     reddit = get_praw_reddit()
     translated_query = translate_query(query)
@@ -153,7 +264,9 @@ def scrape_reddit_praw(
     print(f"Scraping via PRAW: '{translated_query}' in r/{target_subreddit.display_name} (Sort: {sort}, Time: {time_filter})...")
     
     with Session(engine) as session:
-        for submission in target_subreddit.search(translated_query, sort=sort, time_filter=time_filter, limit=post_limit):
+        search_limit = None if fill_post_limit else post_limit
+        usable_posts = 0
+        for submission in target_subreddit.search(translated_query, sort=sort, time_filter=time_filter, limit=search_limit):
             if skip_existing:
                 existing = session.get(Post, submission.id)
                 if existing:
@@ -173,6 +286,8 @@ def scrape_reddit_praw(
                 status=post_status
             )
             upsert_post(session, post)
+            if post_status != "skipped":
+                usable_posts += 1
             
             submission.comments.replace_more(limit=0)
             comments_fetched = 0
@@ -193,6 +308,9 @@ def scrape_reddit_praw(
                 )
                 upsert_comment(session, db_comment)
                 comments_fetched += 1
+
+            if fill_post_limit and usable_posts >= post_limit:
+                break
                 
     print("Scraping completed.")
 
@@ -330,85 +448,38 @@ def fetch_comments_for_post(session, post_id: str, comment_limit: int, pw_manage
     return fetch_comments_pullpush(session, post_id, comment_limit)
 
 
-def scrape_reddit_json(
-    query: str, 
-    subreddits: Optional[List[str]] = None, 
-    post_limit: int = 100, 
-    comment_limit: int = 100, 
-    sort: str = "top", 
-    time_filter: str = "all", 
-    skip_existing: bool = True
-):
-    translated_query = translate_query(query)
-    encoded_query = urllib.parse.quote(translated_query)
-    
-    posts_list = []
-    
-    t_val = time_filter
-    if subreddits and len(subreddits) > 0:
-        subreddit_str = "+".join([s.strip() for s in subreddits])
-        direct_url = f"https://www.reddit.com/r/{subreddit_str}/search.json?q={encoded_query}&sort={sort}&t={t_val}&limit={post_limit}"
-    else:
-        direct_url = f"https://www.reddit.com/search.json?q={encoded_query}&sort={sort}&t={t_val}&limit={post_limit}"
-        
-    pw_manager = PlaywrightManager()
-    
-    # 1. Try direct search using curl_cffi
-    print(f"Attempting direct Reddit JSON scrape (with Chrome impersonation)...")
-    try:
-        payload = fetch_json(direct_url, use_impersonation=True)
-        raw_children = payload.get("data", {}).get("children", [])
-        posts_list = [child.get("data", {}) for child in raw_children]
-        print(f"  SUCCESS! Fetched {len(posts_list)} posts directly from Reddit.")
-    except Exception as e:
-        print(f"  Direct Reddit search failed: {e}")
-        
-    # 2. Try Playwright search fallback
-    if not posts_list:
-        print("Falling back to Playwright for search...")
-        try:
-            page = pw_manager.get_page()
-            payload = fetch_json_playwright(page, direct_url)
-            raw_children = payload.get("data", {}).get("children", [])
-            posts_list = [child.get("data", {}) for child in raw_children]
-            print(f"  SUCCESS! Fetched {len(posts_list)} posts using Playwright.")
-        except Exception as e:
-            print(f"  Playwright search failed: {e}")
-            
-    # 3. Try PullPush fallback
-    if not posts_list:
-        print("Falling back to PullPush API for submissions...")
-        subs = subreddits if subreddits else [None]
-        for sub in subs:
-            pp_url = build_pullpush_url("submission", encoded_query, post_limit, subreddit=sub, sort=sort, time_filter=time_filter)
-            print(f"  Querying PullPush: {pp_url}")
-            try:
-                payload = fetch_json(pp_url, use_impersonation=False)
-                returned_data = payload.get("data", [])
-                print(f"  PullPush API returned {len(returned_data)} submissions.")
-                posts_list.extend(returned_data)
-            except Exception as e:
-                print(f"  PullPush failed for subreddit {sub}: {e}")
-                
+def save_posts_from_batches(
+    batches: Iterable[List[dict]],
+    comment_limit: int,
+    pw_manager: PlaywrightManager,
+    skip_existing: bool,
+    post_limit: int,
+    fill_post_limit: bool,
+    comments_fetcher: Callable[[Session, str, int, PlaywrightManager], int],
+) -> tuple[int, int, int]:
     added_posts = 0
+    usable_posts = 0
     skipped_posts = 0
-    try:
-        with Session(engine) as session:
-            for p_data in tqdm(posts_list, desc="Scraping comments & saving posts"):
+    seen_post_ids = set()
+
+    with Session(engine) as session:
+        for posts in batches:
+            for p_data in tqdm(posts, desc="Scraping comments & saving posts"):
                 post_id = p_data.get("id")
-                if not post_id:
+                if not post_id or post_id in seen_post_ids:
                     continue
-                    
+                seen_post_ids.add(post_id)
+
                 if skip_existing:
                     existing = session.get(Post, post_id)
                     if existing:
                         skipped_posts += 1
                         continue
-                        
+
                 post_author = p_data.get("author", "")
                 selftext = p_data.get("selftext", "")
                 post_status = "skipped" if is_low_quality(post_author, selftext) else "pending"
-                
+
                 post = Post(
                     id=post_id,
                     subreddit=p_data.get("subreddit", ""),
@@ -420,116 +491,175 @@ def scrape_reddit_json(
                 )
                 upsert_post(session, post)
                 added_posts += 1
-                
-                # Fetch comments using the full direct -> playwright -> pullpush chain
-                fetch_comments_for_post(session, post_id, comment_limit, pw_manager)
-                
+                if post_status != "skipped":
+                    usable_posts += 1
+
+                comments_fetcher(session, post_id, comment_limit, pw_manager)
+
                 # Sleep to respect rate limits
                 time.sleep(1.0)
+
+                if fill_post_limit and usable_posts >= post_limit:
+                    return added_posts, skipped_posts, usable_posts
+
+    return added_posts, skipped_posts, usable_posts
+
+
+def fetch_comments_with_playwright_primary(session, post_id: str, comment_limit: int, pw_manager: PlaywrightManager) -> int:
+    comments_url = f"https://www.reddit.com/comments/{post_id}.json?limit={comment_limit}"
+    try:
+        page = pw_manager.get_page()
+        c_payload = fetch_json_playwright(page, comments_url)
+        return save_json_comments(session, post_id, c_payload, comment_limit)
+    except Exception as e:
+        tqdm.write(f"  Playwright comments failed for post {post_id}: {e}. Falling back to PullPush.")
+        return fetch_comments_pullpush(session, post_id, comment_limit)
+
+
+def scrape_reddit_json(
+    query: str, 
+    subreddits: Optional[List[str]] = None, 
+    post_limit: int = 50, 
+    comment_limit: int = 50, 
+    sort: str = "top", 
+    time_filter: str = "all", 
+    skip_existing: bool = True,
+    fill_post_limit: bool = True
+):
+    translated_query = translate_query(query)
+    encoded_query = urllib.parse.quote(translated_query)
+
+    pw_manager = PlaywrightManager()
+    batches = None
+    
+    # 1. Try direct search using curl_cffi
+    print(f"Attempting direct Reddit JSON scrape (with Chrome impersonation)...")
+    try:
+        batches = reddit_search_batches(
+            lambda url: fetch_json(url, use_impersonation=True),
+            translated_query,
+            subreddits,
+            post_limit,
+            sort,
+            time_filter,
+            fill_post_limit,
+        )
+        first_batch = next(batches)
+        if first_batch:
+            batches = chain([first_batch], batches)
+            print(f"  SUCCESS! Fetched {len(first_batch)} posts directly from Reddit.")
+        else:
+            batches = None
+            print("  Direct Reddit search returned no posts.")
+    except Exception as e:
+        batches = None
+        print(f"  Direct Reddit search failed: {e}")
+        
+    # 2. Try Playwright search fallback
+    if batches is None:
+        print("Falling back to Playwright for search...")
+        try:
+            page = pw_manager.get_page()
+            batches = reddit_search_batches(
+                lambda url: fetch_json_playwright(page, url),
+                translated_query,
+                subreddits,
+                post_limit,
+                sort,
+                time_filter,
+                fill_post_limit,
+            )
+            first_batch = next(batches)
+            if first_batch:
+                batches = chain([first_batch], batches)
+                print(f"  SUCCESS! Fetched {len(first_batch)} posts using Playwright.")
+            else:
+                batches = None
+                print("  Playwright search returned no posts.")
+        except Exception as e:
+            batches = None
+            print(f"  Playwright search failed: {e}")
+            
+    # 3. Try PullPush fallback
+    if batches is None:
+        print("Falling back to PullPush API for submissions...")
+        batches = pullpush_search_batches(encoded_query, subreddits, post_limit, sort, time_filter, fill_post_limit)
+
+    try:
+        added_posts, skipped_posts, usable_posts = save_posts_from_batches(
+            batches,
+            comment_limit,
+            pw_manager,
+            skip_existing,
+            post_limit,
+            fill_post_limit,
+            fetch_comments_for_post,
+        )
     finally:
         pw_manager.close()
         
-    print(f"Scraping completed. Added {added_posts} new posts to database, skipped {skipped_posts} existing posts.")
+    print(f"Scraping completed. Added {added_posts} new posts to database ({usable_posts} usable), skipped {skipped_posts} existing posts.")
 
 
 def scrape_reddit_playwright(
     query: str, 
     subreddits: Optional[List[str]] = None, 
-    post_limit: int = 100, 
-    comment_limit: int = 100, 
+    post_limit: int = 50, 
+    comment_limit: int = 50, 
     sort: str = "top", 
     time_filter: str = "all", 
-    skip_existing: bool = True
+    skip_existing: bool = True,
+    fill_post_limit: bool = True
 ):
     translated_query = translate_query(query)
     encoded_query = urllib.parse.quote(translated_query)
-    
-    posts_list = []
-    
-    t_val = time_filter
-    if subreddits and len(subreddits) > 0:
-        subreddit_str = "+".join([s.strip() for s in subreddits])
-        direct_url = f"https://www.reddit.com/r/{subreddit_str}/search.json?q={encoded_query}&sort={sort}&t={t_val}&limit={post_limit}"
-    else:
-        direct_url = f"https://www.reddit.com/search.json?q={encoded_query}&sort={sort}&t={t_val}&limit={post_limit}"
-        
+
     pw_manager = PlaywrightManager()
+    batches = None
     
     # 1. Playwright search (primary)
     print(f"Attempting Reddit JSON scrape using Playwright...")
     try:
         page = pw_manager.get_page()
-        payload = fetch_json_playwright(page, direct_url)
-        raw_children = payload.get("data", {}).get("children", [])
-        posts_list = [child.get("data", {}) for child in raw_children]
-        print(f"  SUCCESS! Fetched {len(posts_list)} posts using Playwright.")
+        batches = reddit_search_batches(
+            lambda url: fetch_json_playwright(page, url),
+            translated_query,
+            subreddits,
+            post_limit,
+            sort,
+            time_filter,
+            fill_post_limit,
+        )
+        first_batch = next(batches)
+        if first_batch:
+            batches = chain([first_batch], batches)
+            print(f"  SUCCESS! Fetched {len(first_batch)} posts using Playwright.")
+        else:
+            batches = None
+            print("  Playwright search returned no posts.")
     except Exception as e:
+        batches = None
         print(f"  Playwright search failed: {e}")
         
     # 2. Try PullPush fallback
-    if not posts_list:
+    if batches is None:
         print("Falling back to PullPush API for submissions...")
-        subs = subreddits if subreddits else [None]
-        for sub in subs:
-            pp_url = build_pullpush_url("submission", encoded_query, post_limit, subreddit=sub, sort=sort, time_filter=time_filter)
-            print(f"  Querying PullPush: {pp_url}")
-            try:
-                payload = fetch_json(pp_url, use_impersonation=False)
-                returned_data = payload.get("data", [])
-                print(f"  PullPush API returned {len(returned_data)} submissions.")
-                posts_list.extend(returned_data)
-            except Exception as e:
-                print(f"  PullPush failed for subreddit {sub}: {e}")
-                
-    added_posts = 0
-    skipped_posts = 0
+        batches = pullpush_search_batches(encoded_query, subreddits, post_limit, sort, time_filter, fill_post_limit)
+
     try:
-        with Session(engine) as session:
-            for p_data in tqdm(posts_list, desc="Scraping comments & saving posts"):
-                post_id = p_data.get("id")
-                if not post_id:
-                    continue
-                    
-                if skip_existing:
-                    existing = session.get(Post, post_id)
-                    if existing:
-                        skipped_posts += 1
-                        continue
-                        
-                post_author = p_data.get("author", "")
-                selftext = p_data.get("selftext", "")
-                post_status = "skipped" if is_low_quality(post_author, selftext) else "pending"
-                
-                post = Post(
-                    id=post_id,
-                    subreddit=p_data.get("subreddit", ""),
-                    title=p_data.get("title", ""),
-                    selftext=selftext,
-                    score=p_data.get("score", 0),
-                    created_utc=p_data.get("created_utc", 0.0),
-                    status=post_status
-                )
-                upsert_post(session, post)
-                added_posts += 1
-                
-                # Sleep to respect rate limits
-                time.sleep(1.0)
-                
-                # Fetch comments: Playwright primary, fallback to PullPush
-                comments_url = f"https://www.reddit.com/comments/{post_id}.json?limit={comment_limit}"
-                comments_fetched = 0
-                try:
-                    page = pw_manager.get_page()
-                    c_payload = fetch_json_playwright(page, comments_url)
-                    comments_fetched = save_json_comments(session, post_id, c_payload, comment_limit)
-                except Exception as e:
-                    tqdm.write(f"  Playwright comments failed for post {post_id}: {e}. Falling back to PullPush.")
-                    comments_fetched = fetch_comments_pullpush(session, post_id, comment_limit)
-                    
+        added_posts, skipped_posts, usable_posts = save_posts_from_batches(
+            batches,
+            comment_limit,
+            pw_manager,
+            skip_existing,
+            post_limit,
+            fill_post_limit,
+            fetch_comments_with_playwright_primary,
+        )
     finally:
         pw_manager.close()
         
-    print(f"Scraping completed. Added {added_posts} new posts to database, skipped {skipped_posts} existing posts.")
+    print(f"Scraping completed. Added {added_posts} new posts to database ({usable_posts} usable), skipped {skipped_posts} existing posts.")
 
 
 def fetch_comments_pullpush(session, post_id: str, comment_limit: int) -> int:

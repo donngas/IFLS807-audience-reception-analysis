@@ -1,5 +1,7 @@
 import os
+import asyncio
 import json
+from dataclasses import dataclass
 from typing import Literal, Optional, List
 from pydantic import BaseModel, Field
 from tqdm import tqdm
@@ -13,8 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import (
-    Session, engine, get_pending_posts, get_pending_comments,
-    upsert_post, upsert_comment, get_unmapped_raw_tags,
+    Session, engine, upsert_post, upsert_comment, get_unmapped_raw_tags,
     Annotation, upsert_annotation, update_consolidated_tags, Post, Comment
 )
 
@@ -27,14 +28,55 @@ class Stage1Output(BaseModel):
         description="A concise 1-2 sentence summary of the post or comment."
     )
     raw_tag: str = Field(
-        description="A primary 1-3 word descriptor theme (e.g., 'chemistry', 'pacing issues'). Use 'Reaction Only' if no specific analytical theme."
+        description="A primary 2-5 word descriptor theme that captures the reason for the reaction when available. Use 'Reaction Only' if no specific analytical theme."
     )
 
 # Stage 2 Schema (Cluster Labeling from LLM)
 class ClusterLabelOutput(BaseModel):
     consolidated_tag: str = Field(
-        description="A concise 1-3 word descriptor category for this cluster of reactions (e.g., 'Character Chemistry', 'Dialogue Quality', etc.)."
+        description="A concise 2-5 word descriptor category for this cluster of reactions."
     )
+
+
+STAGE_1_SYSTEM_PROMPT = (
+    "You are an expert audience reception analyst specializing in how viewers discuss "
+    "serialized television relationships on Reddit. Analyze the given text and extract "
+    "its sentiment, a concise summary, and a primary thematic tag.\n\n"
+    "SENTIMENT — You MUST choose exactly one of these five values:\n"
+    "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
+    "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
+    "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
+    "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
+    "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
+    "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point.\n\n"
+    "RAW TAG — Assign a neutral 2-5 word thematic descriptor that captures the specific "
+    "reason behind the reaction when the text provides one. Prefer tags like "
+    "'earned emotional payoff', 'forced conflict writing', 'supportive partner dynamic', "
+    "'inconsistent character motivation', or 'chemistry through banter' over generic tags "
+    "like 'character behavior', 'character analysis', or 'relationship opinion'. "
+    "Do not invent reasons that are not stated or strongly implied. If the text is too short "
+    "(<15 chars), deleted, or lacks analytical substance, use 'Reaction Only'.\n\n"
+    "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
+    '{"sentiment": <float>, "summary": "<string>", "raw_tag": "<string>"}'
+)
+
+SENTIMENT_VALUES = [-1.0, -0.5, 0.0, 0.5, 1.0]
+
+
+@dataclass(frozen=True)
+class Stage1Item:
+    item_id: str
+    item_type: Literal["post", "comment"]
+    text: str
+
+
+@dataclass(frozen=True)
+class Stage1Result:
+    item_id: str
+    item_type: Literal["post", "comment"]
+    annotation: Optional[Annotation] = None
+    error: Optional[Exception] = None
+
 
 def parse_json_content(content: str) -> dict:
     """Helper to clean up markdown codeblocks if any, and parse content as JSON."""
@@ -48,7 +90,79 @@ def parse_json_content(content: str) -> dict:
         clean_content = "\n".join(lines).strip()
     return json.loads(clean_content)
 
-def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, temperature: float = 0.1, force_reanalyze: bool = False):
+
+def normalize_stage_1_output(parsed_data: dict) -> Stage1Output:
+    try:
+        raw_sentiment = float(parsed_data.get("sentiment", 0.0))
+    except (ValueError, TypeError):
+        raw_sentiment = 0.0
+    parsed_data["sentiment"] = min(SENTIMENT_VALUES, key=lambda x: abs(x - raw_sentiment))
+    return Stage1Output.model_validate(parsed_data)
+
+
+def analyze_stage_1_item(
+    item: Stage1Item,
+    openrouter_api_key: str,
+    model_name: str,
+    temperature: float,
+) -> Stage1Result:
+    try:
+        with OpenRouter(api_key=openrouter_api_key) as client:
+            response = client.chat.send(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": STAGE_1_SYSTEM_PROMPT},
+                    {"role": "user", "content": item.text}
+                ],
+                temperature=temperature
+            )
+        content = response.choices[0].message.content
+        output = normalize_stage_1_output(parse_json_content(content))
+        annotation = Annotation(
+            item_id=item.item_id,
+            item_type=item.item_type,
+            sentiment=output.sentiment,
+            summary=output.summary,
+            raw_tag=output.raw_tag
+        )
+        return Stage1Result(item_id=item.item_id, item_type=item.item_type, annotation=annotation)
+    except Exception as e:
+        return Stage1Result(item_id=item.item_id, item_type=item.item_type, error=e)
+
+
+async def run_stage_1_item_batch(
+    items: List[Stage1Item],
+    openrouter_api_key: str,
+    model_name: str,
+    temperature: float,
+    concurrency: int,
+    desc: str,
+) -> List[Stage1Result]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(item: Stage1Item) -> Stage1Result:
+        async with semaphore:
+            return await asyncio.to_thread(
+                analyze_stage_1_item,
+                item,
+                openrouter_api_key,
+                model_name,
+                temperature,
+            )
+
+    tasks = [asyncio.create_task(run_one(item)) for item in items]
+    results = []
+    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=desc):
+        results.append(await task)
+    return results
+
+
+def run_stage_1_analysis(
+    model_name: Optional[str] = None,
+    temperature: float = 0.1,
+    force_reanalyze: bool = False,
+    concurrency: int = 5
+):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_api_key:
         raise ValueError("OPENROUTER_API_KEY environment variable is required for Stage 1 analysis.")
@@ -56,115 +170,75 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
     if not model_name:
         model_name = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it")
     
-    system_prompt = (
-        "You are an expert audience reception analyst specializing in how viewers discuss "
-        "serialized television relationships on Reddit. Analyze the given text and extract "
-        "its sentiment, a concise summary, and a primary thematic tag.\n\n"
-        "SENTIMENT — You MUST choose exactly one of these five values:\n"
-        "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
-        "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
-        "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
-        "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
-        "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
-        "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point.\n\n"
-        "RAW TAG — Assign a 1-3 word thematic descriptor reflecting the dominant topic "
-        "(e.g. 'character chemistry', 'plot pacing', 'dialogue quality', 'emotional payoff'). "
-        "If the text is too short (<15 chars), deleted, or lacks analytical substance, use 'Reaction Only'.\n\n"
-        "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
-        '{"sentiment": <float>, "summary": "<string>", "raw_tag": "<string>"}'
+    with Session(engine) as session:
+        if force_reanalyze:
+            posts_stmt = select(Post).where((Post.status == "pending") | (Post.status == "processed"))
+            comments_stmt = select(Comment).where((Comment.status == "pending") | (Comment.status == "processed"))
+        else:
+            posts_stmt = select(Post).where(Post.status == "pending")
+            comments_stmt = select(Comment).where(Comment.status == "pending")
+
+        posts_to_process = session.exec(posts_stmt).all()
+        comments_to_process = session.exec(comments_stmt).all()
+
+    post_items = [
+        Stage1Item(
+            item_id=post.id,
+            item_type="post",
+            text=f"Title: {post.title}\n\nBody: {post.selftext}",
+        )
+        for post in posts_to_process
+    ]
+    comment_items = [
+        Stage1Item(item_id=comment.id, item_type="comment", text=comment.body)
+        for comment in comments_to_process
+    ]
+
+    print(f"Stage 1: Processing {len(post_items)} posts with concurrency {max(1, concurrency)}...")
+    post_results = asyncio.run(
+        run_stage_1_item_batch(
+            post_items,
+            openrouter_api_key,
+            model_name,
+            temperature,
+            concurrency,
+            "Analyzing Posts",
+        )
     )
-    
-    with OpenRouter(api_key=openrouter_api_key) as client:
-        with Session(engine) as session:
-            # Process Posts
-            if force_reanalyze:
-                posts_stmt = select(Post).where((Post.status == "pending") | (Post.status == "processed")).limit(limit)
-                posts_to_process = session.exec(posts_stmt).all()
+
+    print(f"Stage 1: Processing {len(comment_items)} comments with concurrency {max(1, concurrency)}...")
+    comment_results = asyncio.run(
+        run_stage_1_item_batch(
+            comment_items,
+            openrouter_api_key,
+            model_name,
+            temperature,
+            concurrency,
+            "Analyzing Comments",
+        )
+    )
+
+    with Session(engine) as session:
+        for result in post_results + comment_results:
+            if result.annotation:
+                upsert_annotation(session, result.annotation)
+
+            if result.item_type == "post":
+                item = session.get(Post, result.item_id)
+                upsert_item = upsert_post
             else:
-                posts_to_process = get_pending_posts(session, limit=limit)
-                
-            print(f"Stage 1: Processing {len(posts_to_process)} posts...")
-            for post in tqdm(posts_to_process, desc="Analyzing Posts"):
-                text_to_analyze = f"Title: {post.title}\n\nBody: {post.selftext}"
-                try:
-                    response = client.chat.send(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": text_to_analyze}
-                        ],
-                        temperature=temperature
-                    )
-                    content = response.choices[0].message.content
-                    parsed_data = parse_json_content(content)
-                    
-                    # Fallback: snap to nearest discrete value if LLM returns an off-scale score
-                    try:
-                        raw_sentiment = float(parsed_data.get("sentiment", 0.0))
-                    except (ValueError, TypeError):
-                        raw_sentiment = 0.0
-                    parsed_data["sentiment"] = min(
-                        [-1.0, -0.5, 0.0, 0.5, 1.0], key=lambda x: abs(x - raw_sentiment)
-                    )
-                    
-                    output = Stage1Output.model_validate(parsed_data)
-                    annotation = Annotation(
-                        item_id=post.id,
-                        item_type="post",
-                        sentiment=output.sentiment,
-                        summary=output.summary,
-                        raw_tag=output.raw_tag
-                    )
-                    upsert_annotation(session, annotation)
-                    post.status = "processed"
-                except Exception as e:
-                    print(f"Failed to process post {post.id}: {e}")
-                    post.status = "failed"
-                upsert_post(session, post)
-                
-            # Process Comments
-            if force_reanalyze:
-                comments_stmt = select(Comment).where((Comment.status == "pending") | (Comment.status == "processed")).limit(limit)
-                comments_to_process = session.exec(comments_stmt).all()
+                item = session.get(Comment, result.item_id)
+                upsert_item = upsert_comment
+
+            if not item:
+                continue
+            if result.error:
+                print(f"Failed to process {result.item_type} {result.item_id}: {result.error}")
+                item.status = "failed"
             else:
-                comments_to_process = get_pending_comments(session, limit=limit)
-                
-            print(f"Stage 1: Processing {len(comments_to_process)} comments...")
-            for comment in tqdm(comments_to_process, desc="Analyzing Comments"):
-                try:
-                    response = client.chat.send(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": comment.body}
-                        ],
-                        temperature=temperature
-                    )
-                    content = response.choices[0].message.content
-                    parsed_data = parse_json_content(content)
-                    
-                    # Safely map sentiment to nearest discrete allowed value
-                    try:
-                        raw_sentiment = float(parsed_data.get("sentiment", 0.0))
-                    except (ValueError, TypeError):
-                        raw_sentiment = 0.0
-                    mapped_sentiment = min([-1.0, -0.5, 0.0, 0.5, 1.0], key=lambda x: abs(x - raw_sentiment))
-                    parsed_data["sentiment"] = mapped_sentiment
-                    
-                    output = Stage1Output.model_validate(parsed_data)
-                    annotation = Annotation(
-                        item_id=comment.id,
-                        item_type="comment",
-                        sentiment=output.sentiment,
-                        summary=output.summary,
-                        raw_tag=output.raw_tag
-                    )
-                    upsert_annotation(session, annotation)
-                    comment.status = "processed"
-                except Exception as e:
-                    print(f"Failed to process comment {comment.id}: {e}")
-                    comment.status = "failed"
-                upsert_comment(session, comment)
+                item.status = "processed"
+            upsert_item(session, item)
+
     print("Stage 1 feature extraction completed.")
 
 def run_stage_2_analysis(
@@ -337,9 +411,12 @@ def run_stage_2_analysis(
                         f"group of {len(cluster_annotations)} audience reactions:\n\n"
                         f"{sample_text}\n"
                         "Identify the unifying theme across these reactions and produce a single "
-                        "consolidated tag (1-3 words) that captures the shared topic or concern. "
-                        "Good examples: 'Character Chemistry', 'Emotional Payoff', 'Writing Quality', "
-                        "'Relationship Dynamics', 'Pacing Issues'.\n\n"
+                        "consolidated tag (2-5 words) that captures the shared topic or concern, "
+                        "including the specific reason for praise or criticism when it is clear. "
+                        "Prefer labels like 'earned emotional payoff', 'forced conflict writing', "
+                        "'natural romantic chemistry', or 'inconsistent character motivation' over "
+                        "generic labels like 'Character Analysis' or 'Relationship Dynamics'. "
+                        "Stay neutral and do not infer a reason that is not present in the examples.\n\n"
                         "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
                         '{"consolidated_tag": "<your label>"}'
                     )

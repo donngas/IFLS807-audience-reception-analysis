@@ -6,7 +6,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from database import Post, Comment, SQLModel, Annotation
-from sqlmodel import Session, create_engine
+from sqlmodel import Session, create_engine, select
 from scraper import is_low_quality, translate_query
 
 # Create an in-memory engine for testing
@@ -346,6 +346,83 @@ def test_scrape_reddit_json_direct_success_mock(mock_fetch_json_playwright, mock
         comment = session.get(Comment, "direct_comment1")
         assert comment is not None
         assert comment.body == "Direct Comment Body"
+
+
+@patch("scraper.fetch_json")
+@patch("scraper.PlaywrightManager")
+@patch("scraper.fetch_json_playwright")
+def test_scrape_reddit_json_fill_post_limit_fetches_past_skipped(mock_fetch_json_playwright, mock_playwright_manager, mock_fetch_json):
+    first_search_res = {
+        "data": {
+            "after": "t3_after_first",
+            "children": [
+                {
+                    "data": {
+                        "id": "skipped_post",
+                        "subreddit": "testsub",
+                        "title": "Skipped Post",
+                        "selftext": "",
+                        "score": 1,
+                        "created_utc": 100.0,
+                        "author": "RealUser"
+                    }
+                }
+            ]
+        }
+    }
+
+    second_search_res = {
+        "data": {
+            "after": None,
+            "children": [
+                {
+                    "data": {
+                        "id": "usable_post",
+                        "subreddit": "testsub",
+                        "title": "Usable Post",
+                        "selftext": "This post has body text.",
+                        "score": 2,
+                        "created_utc": 200.0,
+                        "author": "RealUser"
+                    }
+                }
+            ]
+        }
+    }
+
+    empty_comments_res = [{}, {"data": {"children": []}}]
+    mock_fetch_json.side_effect = [
+        first_search_res,
+        empty_comments_res,
+        second_search_res,
+        empty_comments_res,
+    ]
+
+    from scraper import scrape_reddit
+    with patch("time.sleep"):
+        scrape_reddit(
+            "query",
+            subreddits=["testsub"],
+            post_limit=1,
+            comment_limit=1,
+            method="json",
+            fill_post_limit=True,
+        )
+
+    with Session(test_engine) as session:
+        skipped_post = session.get(Post, "skipped_post")
+        usable_post = session.get(Post, "usable_post")
+        pending_posts = session.exec(select(Post).where(Post.status == "pending")).all()
+
+        assert skipped_post is not None
+        assert skipped_post.status == "skipped"
+        assert usable_post is not None
+        assert usable_post.status == "pending"
+        assert len(pending_posts) == 1
+
+    search_urls = [call.args[0] for call in mock_fetch_json.call_args_list if "search.json" in call.args[0]]
+    assert len(search_urls) == 2
+    assert "after=t3_after_first" in search_urls[1]
 
 
 @patch("scraper.fetch_json")
