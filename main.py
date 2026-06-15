@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--sort", type=str, default="top", help="Reddit search sort")
     parser.add_argument("--time-filter", type=str, default="all", help="Reddit search time filter")
     parser.add_argument("--force-overwrite", action="store_true", help="Force overwrite existing scraped items")
+    parser.add_argument("--method", choices=["praw", "json"], default="praw", help="Data acquisition method (praw or json)")
     
     # Stage 1 args
     parser.add_argument("--model", type=str, help="OpenRouter model name")
@@ -63,7 +64,7 @@ def main():
             print("Error: --query is required for scrape action.")
             return
         sub_list = [s.strip() for s in args.subreddits.split(",")] if args.subreddits else None
-        scrape_reddit(args.query, sub_list, args.post_limit, args.comment_limit, sort=args.sort, time_filter=args.time_filter, skip_existing=not args.force_overwrite)
+        scrape_reddit(args.query, sub_list, args.post_limit, args.comment_limit, sort=args.sort, time_filter=args.time_filter, skip_existing=not args.force_overwrite, method=args.method)
         
     elif args.action == "analyze":
         print("Starting Stage 1 Analysis (Feature Extraction)...")
@@ -118,6 +119,17 @@ def run_interactive_wizard():
             p_limit = questionary.text("Post limit:", default="100").ask()
             c_limit = questionary.text("Comment limit per post:", default="100").ask()
             
+            # Data Acquisition Method Choice
+            method_choice = questionary.select(
+                "Select data acquisition method:",
+                choices=[
+                    "1. PRAW (Reddit API - requires credentials)",
+                    "2. Unauthenticated JSON (Bypass API keys)"
+                ],
+                default="1. PRAW (Reddit API - requires credentials)"
+            ).ask()
+            method_val = "praw" if "PRAW" in method_choice else "json"
+            
             # Advanced Scraping Options
             sort_val = "top"
             time_val = "all"
@@ -128,7 +140,7 @@ def run_interactive_wizard():
                 time_val = questionary.select("Time filter:", choices=["all", "day", "week", "month", "year"], default="all").ask()
                 skip_val = questionary.confirm("Skip already scraped posts?", default=True).ask()
                 
-            scrape_reddit(query, sub_list, int(p_limit), int(c_limit), sort=sort_val, time_filter=time_val, skip_existing=skip_val)
+            scrape_reddit(query, sub_list, int(p_limit), int(c_limit), sort=sort_val, time_filter=time_val, skip_existing=skip_val, method=method_val)
             
         elif choice.startswith("2"):
             # Default or Advanced Stage 1

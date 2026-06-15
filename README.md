@@ -93,7 +93,10 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 
 ### 1. Reddit Acquisition (`scraper.py`)
 
-- Queries designated subreddits using Reddit's native search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
+- **Acquisition Methods**: Exposes a modular, plug-and-play design supporting two methods:
+  - **PRAW (Reddit API)**: Uses official credentials (`REDDIT_CLIENT_ID`, etc.) and PRAW wrapper functions.
+  - **Unauthenticated JSON (API Bypass)**: Direct HTTP requests to Reddit's public `.json` endpoints (e.g., `search.json` and `comments.json`). Automatically respects rate limits by sleeping 1 second between requests.
+- Queries designated subreddits using Reddit's search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
 - **Query Translation**: Since custom queries might be entered using curly braces (e.g. `{Jake AND Amy}`), the scraper automatically normalizes these to standard parenthetical expressions (e.g. `(Jake AND Amy)`) before sending them to PRAW.
 - **Ordering**: Results are sorted by configurable parameters (such as `top`, `hot`, `new`, `relevance`) with a time filter (such as `all`, `year`, `month`, `week`, `day`).
 - **Scrape Volume**: Scrapes approximately 100 posts per query and up to 100 top-level comments per post.

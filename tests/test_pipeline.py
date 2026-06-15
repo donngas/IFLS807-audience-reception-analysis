@@ -231,3 +231,60 @@ def test_visualizations(mock_handle_output):
 
     assert mock_handle_output.call_count == 8
 
+@patch("scraper.fetch_unauthenticated_json")
+def test_scrape_reddit_json_mock(mock_fetch_json):
+    # Mock the return values for search and comments
+    mock_search_res = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "post_json1",
+                        "subreddit": "testsub",
+                        "title": "Test Post JSON",
+                        "selftext": "Test Body JSON",
+                        "score": 10,
+                        "created_utc": 1000000.0,
+                        "author": "User"
+                    }
+                }
+            ]
+        }
+    }
+    
+    mock_comments_res = [
+        {},
+        {
+            "data": {
+                "children": [
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "id": "comment_json1",
+                            "body": "Test Comment JSON",
+                            "score": 5,
+                            "created_utc": 1000010.0,
+                            "author": "User2"
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+    
+    mock_fetch_json.side_effect = [mock_search_res, mock_comments_res]
+    
+    from scraper import scrape_reddit
+    with patch("time.sleep"):
+        scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="json")
+        
+    with Session(test_engine) as session:
+        post = session.get(Post, "post_json1")
+        assert post is not None
+        assert post.title == "Test Post JSON"
+        
+        comment = session.get(Comment, "comment_json1")
+        assert comment is not None
+        assert comment.body == "Test Comment JSON"
+
+
