@@ -1,3 +1,4 @@
 - use uv for dependency management and all execution including but not limited to tests.
 - have default tests passable without the credentials configured.
-- granular commit, following conventional commit rules.
+- do granular commits, following conventional commit rules.
+- do NOT commit and/or push without explicit directions.
