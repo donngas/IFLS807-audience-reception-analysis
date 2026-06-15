@@ -19,6 +19,7 @@ ENV/
 *.jsonl
 *.csv
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
 
