@@ -20,7 +20,7 @@ A --> C[scraper.py]
 A --> D[analyzer.py]
 
 C -->|PRAW Scrape| B[(SQLite DB)]
-D -->|Ollama / Gemma| B
+D -->|OpenRouter LLM & Embeddings| B
 
 subgraph Modules
 C[scraper.py: Reddit Acquisition]
@@ -106,7 +106,7 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 ### 2. Stage 1: Feature Extraction (`analyzer.py`)
 
 - Performs LLM inference on individual posts and top-level comments marked as `pending`.
-- Queries Gemma 4 E4B via Ollama or OpenRouter models (e.g. `google/gemini-2.5-flash`) to retrieve structured JSON. Enforces JSON schemas using Pydantic models.
+- Queries OpenRouter models (e.g. `google/gemini-2.5-flash`) to retrieve structured JSON. Enforces JSON schemas using Pydantic models.
 - Structured JSON fields:
   - **sentiment**: A discrete numeric score representing sentiment polarity, restricted to exactly: `[-1.0, -0.5, 0.0, 0.5, 1.0]` (Strongly Negative, Negative, Neutral/Mixed, Positive, Strongly Positive).
   - **summary**: A concise 1-2 sentence summarization.
@@ -135,8 +135,7 @@ Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a h
 Environment variables will be managed using a local `.env` file loaded via `dotenv` in `main.py`. Reference `.env.example` for details:
 
 - **Reddit API**: `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`
-- **Ollama**: `OLLAMA_HOST` (defaults to `http://localhost:11434`), `OLLAMA_MODEL` (defaults to `gemma4:e4b`)
-- **OpenRouter & LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (e.g., `google/gemini-2.5-flash`)
+- **OpenRouter & LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (e.g., `google/gemini-2.5-flash`), `OPENROUTER_MODEL_STAGE2` (defaults to `google/gemini-2.5-flash`)
 
 ### Package Management & Execution
 
