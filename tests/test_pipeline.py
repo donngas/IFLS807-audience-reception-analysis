@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from database import Post, Comment, TagMapping, SQLModel
+from database import Post, Comment, SQLModel, Annotation
 from sqlmodel import Session, create_engine
 from scraper import is_low_quality, translate_query
 
@@ -81,15 +81,18 @@ def test_scrape_reddit_mock(mock_get_reddit):
         assert comment is not None
         assert comment.status == "pending"
 
-@patch("analyzer.ollama.Client")
-def test_stage_1_analysis(mock_ollama_client):
-    # Mock Ollama Response
+@patch("analyzer.OpenRouter")
+@patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
+def test_stage_1_analysis(mock_openrouter):
+    # Mock OpenRouter Response
     mock_client_instance = MagicMock()
-    mock_ollama_client.return_value = mock_client_instance
+    mock_openrouter.return_value.__enter__.return_value = mock_client_instance
     
     mock_response = MagicMock()
-    mock_response.message.content = '{"sentiment": 0.5, "summary": "A good post.", "raw_tag": "positive feedback"}'
-    mock_client_instance.chat.return_value = mock_response
+    mock_choice = MagicMock()
+    mock_choice.message.content = '{"sentiment": 0.5, "summary": "A good post.", "raw_tag": "positive feedback"}'
+    mock_response.choices = [mock_choice]
+    mock_client_instance.chat.send.return_value = mock_response
     
     with Session(test_engine) as session:
         # Add a pending post manually
@@ -103,33 +106,43 @@ def test_stage_1_analysis(mock_ollama_client):
     with Session(test_engine) as session:
         post = session.get(Post, "post_test_1")
         assert post.status == "processed"
-        assert post.sentiment == 0.5
-        assert post.raw_tag == "positive feedback"
         
-        tag = session.get(TagMapping, "positive feedback")
-        assert tag is not None
-        assert tag.consolidated_tag is None
+        annotation = session.get(Annotation, "post_test_1")
+        assert annotation is not None
+        assert annotation.item_type == "post"
+        assert annotation.sentiment == 0.5
+        assert annotation.raw_tag == "positive feedback"
+        assert annotation.consolidated_tag is None
 
-@patch("analyzer.genai.Client")
-@patch.dict('os.environ', {"GEMINI_API_KEY": "test_key"})
-def test_stage_2_analysis(mock_genai_client):
-    # Mock Gemini Response
+@patch("analyzer.OpenRouter")
+@patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
+def test_stage_2_analysis(mock_openrouter):
+    # Mock OpenRouter Response
     mock_client_instance = MagicMock()
-    mock_genai_client.return_value = mock_client_instance
+    mock_openrouter.return_value.__enter__.return_value = mock_client_instance
     
     mock_response = MagicMock()
-    mock_response.text = '{"tag_mappings": {"positive feedback": "Appreciation"}}'
-    mock_client_instance.models.generate_content.return_value = mock_response
+    mock_choice = MagicMock()
+    mock_choice.message.content = '{"tag_mappings": {"positive feedback": "Appreciation"}}'
+    mock_response.choices = [mock_choice]
+    mock_client_instance.chat.send.return_value = mock_response
     
     with Session(test_engine) as session:
-        # Add an unmapped tag
-        t = TagMapping(raw_tag="positive feedback")
-        session.add(t)
+        # Add an unmapped tag via Annotation record
+        ann = Annotation(
+            item_id="post_test_2",
+            item_type="post",
+            sentiment=0.5,
+            summary="A good post.",
+            raw_tag="positive feedback",
+            consolidated_tag=None
+        )
+        session.add(ann)
         session.commit()
         
     from analyzer import run_stage_2_analysis
     run_stage_2_analysis()
     
     with Session(test_engine) as session:
-        tag = session.get(TagMapping, "positive feedback")
-        assert tag.consolidated_tag == "Appreciation"
+        annotation = session.get(Annotation, "post_test_2")
+        assert annotation.consolidated_tag == "Appreciation"

@@ -12,9 +12,6 @@ class Post(SQLModel, table=True):
     score: int
     created_utc: float
     status: str = Field(default="pending", description="pending | processed | failed | skipped")
-    sentiment: Optional[float] = None
-    summary: Optional[str] = None
-    raw_tag: Optional[str] = None
 
 class Comment(SQLModel, table=True):
     id: str = Field(primary_key=True, description="Reddit Comment ID")
@@ -23,13 +20,14 @@ class Comment(SQLModel, table=True):
     score: int
     created_utc: float
     status: str = Field(default="pending", description="pending | processed | failed | skipped")
-    sentiment: Optional[float] = None
-    summary: Optional[str] = None
-    raw_tag: Optional[str] = None
 
-class TagMapping(SQLModel, table=True):
-    raw_tag: str = Field(primary_key=True, description="Primary Key")
-    consolidated_tag: Optional[str] = None
+class Annotation(SQLModel, table=True):
+    item_id: str = Field(primary_key=True, description="Reddit Post ID or Comment ID")
+    item_type: str = Field(description="post | comment")
+    sentiment: float
+    summary: str
+    raw_tag: str
+    consolidated_tag: Optional[str] = Field(default=None, nullable=True)
 
 
 # Database Connection & Setup
@@ -57,6 +55,11 @@ def upsert_comment(session: Session, comment: Comment):
     session.merge(comment)
     session.commit()
 
+def upsert_annotation(session: Session, annotation: Annotation):
+    """Upsert an annotation using session.merge()"""
+    session.merge(annotation)
+    session.commit()
+
 def get_pending_posts(session: Session, limit: int = 50) -> List[Post]:
     statement = select(Post).where(Post.status == "pending").limit(limit)
     return session.exec(statement).all()
@@ -66,27 +69,31 @@ def get_pending_comments(session: Session, limit: int = 50) -> List[Comment]:
     return session.exec(statement).all()
 
 def get_unmapped_raw_tags(session: Session) -> List[str]:
-    statement = select(TagMapping.raw_tag).where(TagMapping.consolidated_tag == None)
+    statement = select(Annotation.raw_tag).where(Annotation.consolidated_tag == None).distinct()
     return session.exec(statement).all()
 
-def upsert_tag_mapping(session: Session, tag: str, consolidated: Optional[str] = None):
-    # Upsert logic to not overwrite consolidated if we are just adding the raw_tag
-    existing = session.get(TagMapping, tag)
-    if not existing:
-        new_tag = TagMapping(raw_tag=tag, consolidated_tag=consolidated)
-        session.add(new_tag)
-    else:
-        if consolidated is not None:
-            existing.consolidated_tag = consolidated
-            session.add(existing)
+def update_consolidated_tags(session: Session, tag_mappings: dict[str, str]):
+    """Update consolidated_tag in Annotation table for all matching raw_tags"""
+    for raw, consolidated in tag_mappings.items():
+        statement = select(Annotation).where(Annotation.raw_tag == raw)
+        annotations = session.exec(statement).all()
+        for ann in annotations:
+            ann.consolidated_tag = consolidated
+            session.add(ann)
     session.commit()
 
 def get_statistics(session: Session) -> dict:
     post_stats = session.exec(select(Post.status, func.count(Post.id)).group_by(Post.status)).all()
     comment_stats = session.exec(select(Comment.status, func.count(Comment.id)).group_by(Comment.status)).all()
     
-    avg_post_sentiment = session.exec(select(func.avg(Post.sentiment)).where(Post.sentiment != None)).first()
-    avg_comment_sentiment = session.exec(select(func.avg(Comment.sentiment)).where(Comment.sentiment != None)).first()
+    avg_post_sentiment = session.exec(
+        select(func.avg(Annotation.sentiment))
+        .where(Annotation.item_type == "post")
+    ).first()
+    avg_comment_sentiment = session.exec(
+        select(func.avg(Annotation.sentiment))
+        .where(Annotation.item_type == "comment")
+    ).first()
     
     return {
         "post_status_counts": dict(post_stats),

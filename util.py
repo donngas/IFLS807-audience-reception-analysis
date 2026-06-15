@@ -1,23 +1,23 @@
 import csv
 import json
-from database import Session, engine, Post, Comment, TagMapping, get_statistics
+from database import Session, engine, Post, Comment, get_statistics, Annotation
 from sqlmodel import select
 
 def get_joined_data(session: Session):
-    # Retrieve all processed posts
-    posts_stmt = select(Post, TagMapping.consolidated_tag).outerjoin(
-        TagMapping, Post.raw_tag == TagMapping.raw_tag
-    ).where(Post.status == "processed")
+    # Retrieve all processed posts along with their annotations
+    posts_stmt = select(Post, Annotation).join(
+        Annotation, Post.id == Annotation.item_id
+    ).where(Post.status == "processed").where(Annotation.item_type == "post")
     posts_data = session.exec(posts_stmt).all()
     
-    # Retrieve all processed comments
-    comments_stmt = select(Comment, TagMapping.consolidated_tag).outerjoin(
-        TagMapping, Comment.raw_tag == TagMapping.raw_tag
-    ).where(Comment.status == "processed")
+    # Retrieve all processed comments along with their annotations
+    comments_stmt = select(Comment, Annotation).join(
+        Annotation, Comment.id == Annotation.item_id
+    ).where(Comment.status == "processed").where(Annotation.item_type == "comment")
     comments_data = session.exec(comments_stmt).all()
     
     combined = []
-    for post, consolidated in posts_data:
+    for post, annotation in posts_data:
         combined.append({
             "type": "post",
             "id": post.id,
@@ -26,13 +26,13 @@ def get_joined_data(session: Session):
             "text": f"{post.title} {post.selftext}".strip(),
             "score": post.score,
             "created_utc": post.created_utc,
-            "sentiment": post.sentiment,
-            "summary": post.summary,
-            "raw_tag": post.raw_tag,
-            "consolidated_tag": consolidated
+            "sentiment": annotation.sentiment,
+            "summary": annotation.summary,
+            "raw_tag": annotation.raw_tag,
+            "consolidated_tag": annotation.consolidated_tag
         })
         
-    for comment, consolidated in comments_data:
+    for comment, annotation in comments_data:
         combined.append({
             "type": "comment",
             "id": comment.id,
@@ -41,10 +41,10 @@ def get_joined_data(session: Session):
             "text": comment.body,
             "score": comment.score,
             "created_utc": comment.created_utc,
-            "sentiment": comment.sentiment,
-            "summary": comment.summary,
-            "raw_tag": comment.raw_tag,
-            "consolidated_tag": consolidated
+            "sentiment": annotation.sentiment,
+            "summary": annotation.summary,
+            "raw_tag": annotation.raw_tag,
+            "consolidated_tag": annotation.consolidated_tag
         })
         
     return combined
