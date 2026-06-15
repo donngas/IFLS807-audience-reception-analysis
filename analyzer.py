@@ -2,6 +2,7 @@ import os
 import json
 from typing import Literal, Optional, List
 from pydantic import BaseModel, Field
+from tqdm import tqdm
 import numpy as np
 from sklearn.cluster import HDBSCAN
 from openrouter import OpenRouter
@@ -56,7 +57,7 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
                 posts_to_process = get_pending_posts(session, limit=limit)
                 
             print(f"Stage 1: Processing {len(posts_to_process)} posts...")
-            for post in posts_to_process:
+            for post in tqdm(posts_to_process, desc="Analyzing Posts"):
                 text_to_analyze = f"Title: {post.title}\n\nBody: {post.selftext}"
                 try:
                     response = client.chat.send(
@@ -98,7 +99,7 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
                 comments_to_process = get_pending_comments(session, limit=limit)
                 
             print(f"Stage 1: Processing {len(comments_to_process)} comments...")
-            for comment in comments_to_process:
+            for comment in tqdm(comments_to_process, desc="Analyzing Comments"):
                 try:
                     response = client.chat.send(
                         model=model_name,
@@ -165,7 +166,7 @@ def run_stage_2_analysis(
             
             if embeddings_needed:
                 print(f"Generating embeddings for {len(embeddings_needed)} annotations using {embedding_model}...")
-                for ann in embeddings_needed:
+                for ann in tqdm(embeddings_needed, desc="Generating Embeddings"):
                     combined_text = f"Tag: {ann.raw_tag} | Summary: {ann.summary}"
                     try:
                         res = client.embeddings.generate(
@@ -270,7 +271,7 @@ def run_stage_2_analysis(
             print("Generating thematic labels for clusters using LLM...")
             cluster_mappings = {}
             with OpenRouter(api_key=openrouter_api_key) as client:
-                for label in valid_labels:
+                for label in tqdm(valid_labels, desc="Labeling Clusters"):
                     # Get all annotations currently assigned to this cluster (including resolved outliers)
                     cluster_ann_indices = [i for i, ann in enumerate(valid_annotations) if ann.cluster_id == label]
                     cluster_annotations = [valid_annotations[i] for i in cluster_ann_indices]
