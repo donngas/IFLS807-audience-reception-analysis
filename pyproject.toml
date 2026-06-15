@@ -3,8 +3,7 @@ name = "ifls807-audience-reception-analysis"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "google-genai>=2.8.0",
-    "ollama>=0.6.2",
+    "openrouter>=0.1.0",
     "praw>=8.0.0",
     "pytest>=9.1.0",
     "python-dotenv>=1.2.2",
