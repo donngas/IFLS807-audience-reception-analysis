@@ -16,6 +16,22 @@ from sklearn.manifold import TSNE
 
 from database import Annotation
 
+SENTIMENT_BUCKETS = [-1.0, -0.5, 0.0, 0.5, 1.0]
+SENTIMENT_LABELS = {
+    -1.0: "Strongly\nNegative",
+    -0.5: "Mildly\nNegative",
+    0.0: "Neutral/\nMixed",
+    0.5: "Mildly\nPositive",
+    1.0: "Strongly\nPositive",
+}
+SENTIMENT_COLORS = {
+    -1.0: "#b2182b",
+    -0.5: "#ef8a62",
+    0.0: "#d9d9d9",
+    0.5: "#67a9cf",
+    1.0: "#2166ac",
+}
+
 # Set default seaborn style for beautiful aesthetics
 sns.set_theme(style="whitegrid")
 plt.rcParams["figure.figsize"] = (10, 6)
@@ -155,7 +171,7 @@ def plot_semantic_map(session: Session, save_path: Optional[str] = None):
     handle_output(fig, save_path)
 
 def plot_sentiment_by_theme(session: Session, save_path: Optional[str] = None):
-    """Generate a box/violin plot of sentiment distribution per consolidated tag."""
+    """Generate a normalized stacked bar chart of sentiment distribution per theme."""
     df = load_annotation_dataframe(session)
     if df.empty:
         print("No data available to plot.")
@@ -166,34 +182,89 @@ def plot_sentiment_by_theme(session: Session, save_path: Optional[str] = None):
     if df_valid.empty:
         print("No annotated items found to show theme sentiment distributions.")
         return
-        
-    # Group by tag and count occurrences for labelling
-    counts = df_valid["consolidated_tag"].value_counts()
-    order = counts.index
-    label_map = {label: wrap_label(f"{label} (n={counts[label]})", width=34) for label in order}
-    df_valid["theme_label"] = df_valid["consolidated_tag"].map(label_map)
-    label_order = [label_map[label] for label in order]
 
-    fig_height = min(14, max(6, 0.45 * len(order) + 2))
-    fig, ax = plt.subplots(figsize=(12, fig_height), constrained_layout=True)
-    
-    sns.boxplot(
-        data=df_valid,
-        y="theme_label",
-        x="sentiment",
-        order=label_order,
-        palette="coolwarm",
-        ax=ax,
-        hue="theme_label",
-        legend=False
+    df_valid["sentiment_bucket"] = df_valid["sentiment"].apply(
+        lambda value: min(SENTIMENT_BUCKETS, key=lambda bucket: abs(bucket - float(value)))
     )
+    counts = df_valid["consolidated_tag"].value_counts()
+    top_themes = counts.head(20).index
+    df_valid = df_valid[df_valid["consolidated_tag"].isin(top_themes)].copy()
+
+    count_table = pd.crosstab(df_valid["consolidated_tag"], df_valid["sentiment_bucket"])
+    count_table = count_table.reindex(index=top_themes, columns=SENTIMENT_BUCKETS, fill_value=0)
+    percent_table = count_table.div(count_table.sum(axis=1), axis=0).fillna(0) * 100
+    theme_labels = [wrap_label(f"{theme} (n={int(counts[theme])})", width=34) for theme in percent_table.index]
+
+    fig_height = min(14, max(6, 0.45 * len(percent_table) + 2))
+    fig, ax = plt.subplots(figsize=(12, fig_height), constrained_layout=True)
+    left = np.zeros(len(percent_table))
+    for bucket in SENTIMENT_BUCKETS:
+        values = percent_table[bucket].values
+        ax.barh(
+            theme_labels,
+            values,
+            left=left,
+            color=SENTIMENT_COLORS[bucket],
+            label=SENTIMENT_LABELS[bucket].replace("\n", " "),
+        )
+        left += values
+
+    ax.invert_yaxis()
     ax.tick_params(axis="y", labelsize=9)
-    
-    ax.set_title("Sentiment Distribution by Consolidated Theme", fontsize=14, fontweight="bold", pad=15)
-    ax.set_xlabel("Sentiment Score (Negative -1.0 to Positive 1.0)", fontsize=11)
+    ax.set_title("Sentiment Composition by Consolidated Theme", fontsize=14, fontweight="bold", pad=15)
+    ax.set_xlabel("Share Within Theme (%)", fontsize=11)
     ax.set_ylabel("Consolidated Theme", fontsize=11)
-    ax.set_xlim(-1.1, 1.1)
+    ax.set_xlim(0, 100)
+    ax.legend(title="Sentiment", loc="lower right", frameon=True, framealpha=0.92, fontsize=8, title_fontsize=9)
     
+    handle_output(fig, save_path)
+
+
+def plot_sentiment_distribution(session: Session, save_path: Optional[str] = None):
+    """Plot the discrete sentiment score distribution overall and by item type."""
+    df = load_annotation_dataframe(session)
+    if df.empty:
+        print("No sentiment annotations available to plot.")
+        return
+
+    df = df.copy()
+    df["sentiment_bucket"] = df["sentiment"].apply(
+        lambda value: min(SENTIMENT_BUCKETS, key=lambda bucket: abs(bucket - float(value)))
+    )
+    rows = []
+    for item_type, frame in [("All", df), ("Posts", df[df["item_type"] == "post"]), ("Comments", df[df["item_type"] == "comment"])]:
+        counts = frame["sentiment_bucket"].value_counts()
+        total = counts.sum()
+        for bucket in SENTIMENT_BUCKETS:
+            count = int(counts.get(bucket, 0))
+            rows.append({
+                "item_type": item_type,
+                "sentiment": bucket,
+                "sentiment_label": SENTIMENT_LABELS[bucket],
+                "count": count,
+                "percent": (count / total * 100) if total else 0.0,
+            })
+    plot_df = pd.DataFrame(rows)
+
+    fig, ax = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
+    sns.barplot(
+        data=plot_df,
+        x="sentiment_label",
+        y="percent",
+        hue="item_type",
+        palette=["#4c78a8", "#72b7b2", "#f58518"],
+        ax=ax,
+    )
+    for container in ax.containers:
+        ax.bar_label(container, labels=[f"{bar.get_height():.1f}%" for bar in container], padding=3, fontsize=8)
+
+    ax.set_title("Relative Sentiment Score Distribution", fontsize=14, fontweight="bold", pad=15)
+    ax.set_xlabel("Sentiment Score", fontsize=11)
+    ax.set_ylabel("Share Within Item Type (%)", fontsize=11)
+    ax.set_ylim(0, max(100, plot_df["percent"].max() * 1.18))
+    ax.legend(title="Item Type", loc="upper right", frameon=True, framealpha=0.92)
+    ax.margins(y=0.15)
+
     handle_output(fig, save_path)
 
 def plot_theme_dominance_bar(session: Session, save_path: Optional[str] = None, top_n: int = 20):

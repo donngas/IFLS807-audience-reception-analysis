@@ -39,6 +39,9 @@ class ClusterLabelOutput(BaseModel):
     consolidated_tag: str = Field(
         description="A concise 2-5 word descriptor category for this cluster of reactions."
     )
+    explanation: str = Field(
+        description="One or two concise sentences explaining why this consolidated tag fits the cluster."
+    )
 
 
 STAGE_1_SYSTEM_PROMPT = (
@@ -101,6 +104,7 @@ class Stage2LabelItem:
     cluster_id: int
     prompt: str
     fallback_label: str
+    fallback_explanation: str
     item_count: int
 
 
@@ -108,6 +112,7 @@ class Stage2LabelItem:
 class Stage2LabelResult:
     cluster_id: int
     label: str
+    explanation: str
     item_count: int
     error: Optional[Exception] = None
 
@@ -142,6 +147,14 @@ def clean_label_text(label: Optional[str]) -> str:
     return label
 
 
+def clean_explanation_text(explanation: Optional[str]) -> str:
+    if not explanation:
+        return ""
+    explanation = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(explanation))
+    explanation = re.sub(r"\s+", " ", explanation).strip(" \"'`")
+    return explanation
+
+
 def is_generic_cluster_label(label: str) -> bool:
     cleaned = clean_label_text(label).lower()
     if not cleaned:
@@ -155,6 +168,13 @@ def fallback_cluster_label(annotations: List[Annotation]) -> str:
     if not tags:
         return "Reaction Only"
     return Counter(tags).most_common(1)[0][0]
+
+
+def fallback_cluster_explanation(label: str, annotations: List[Annotation]) -> str:
+    summaries = [clean_label_text(ann.summary) for ann in annotations if clean_label_text(ann.summary)]
+    if summaries:
+        return f"This cluster is labeled '{label}' because representative items share this pattern: {summaries[0]}"
+    return f"This cluster is labeled '{label}' based on the representative raw tags in the cluster."
 
 
 def is_retryable_openrouter_error(error: Exception) -> bool:
@@ -316,11 +336,18 @@ def label_stage_2_cluster(
         label = clean_label_text(output.consolidated_tag)
         if is_generic_cluster_label(label):
             label = item.fallback_label
-        return Stage2LabelResult(cluster_id=item.cluster_id, label=label, item_count=item.item_count)
+        explanation = clean_explanation_text(output.explanation) or item.fallback_explanation
+        return Stage2LabelResult(
+            cluster_id=item.cluster_id,
+            label=label,
+            explanation=explanation,
+            item_count=item.item_count,
+        )
     except Exception as e:
         return Stage2LabelResult(
             cluster_id=item.cluster_id,
             label=item.fallback_label,
+            explanation=item.fallback_explanation,
             item_count=item.item_count,
             error=e,
         )
@@ -441,7 +468,7 @@ def run_stage_2_analysis(
     min_samples: Optional[int] = None,
     force_reembed: bool = False,
     force_recluster: bool = False,
-    label_sample_size: int = 10,
+    label_sample_size: int = 15,
     concurrency: int = 10
 ):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -533,6 +560,7 @@ def run_stage_2_analysis(
             for ann in valid_annotations:
                 ann.cluster_id = 0
                 ann.consolidated_tag = "Reaction Only"
+                ann.cluster_explanation = "Too few annotations were available for clustering, so this item was assigned to Reaction Only."
                 upsert_annotation(session, ann)
             return
 
@@ -623,13 +651,15 @@ def run_stage_2_analysis(
                     "Stay neutral and do not infer a reason that is not present in the examples. "
                     "Never respond with a placeholder such as 'Cluster 1'.\n\n"
                     "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
-                    '{"consolidated_tag": "<your label>"}'
+                    '{"consolidated_tag": "<your label>", "explanation": "<one or two sentence explanation>"}'
                 )
+                fallback_label = fallback_cluster_label(cluster_annotations)
                 label_items.append(
                     Stage2LabelItem(
                         cluster_id=int(label),
                         prompt=prompt,
-                        fallback_label=fallback_cluster_label(cluster_annotations),
+                        fallback_label=fallback_label,
+                        fallback_explanation=fallback_cluster_explanation(fallback_label, cluster_annotations),
                         item_count=len(cluster_annotations),
                     )
                 )
@@ -643,8 +673,10 @@ def run_stage_2_analysis(
                 )
             )
             cluster_mappings = {}
+            cluster_explanations = {}
             for result in label_results:
                 cluster_mappings[result.cluster_id] = result.label
+                cluster_explanations[result.cluster_id] = result.explanation
                 if result.error:
                     print(f"  Failed to label cluster {result.cluster_id}: {result.error}")
                 print(f"  Cluster {result.cluster_id} labeled: '{result.label}' (based on {result.item_count} items)")
@@ -652,12 +684,17 @@ def run_stage_2_analysis(
             # Apply consolidated tags in the DB
             for ann in valid_annotations:
                 ann.consolidated_tag = cluster_mappings.get(ann.cluster_id, fallback_cluster_label([ann]))
+                ann.cluster_explanation = cluster_explanations.get(
+                    ann.cluster_id,
+                    fallback_cluster_explanation(ann.consolidated_tag, [ann]),
+                )
                 upsert_annotation(session, ann)
                 
         else:
             print("HDBSCAN found 0 clusters. All items classified as noise. Assigning 'Reaction Only'.")
             for ann in valid_annotations:
                 ann.consolidated_tag = "Reaction Only"
+                ann.cluster_explanation = "HDBSCAN found no stable clusters, so all items were assigned to Reaction Only."
                 upsert_annotation(session, ann)
                 
     print("Stage 2 clustering and labeling completed.")

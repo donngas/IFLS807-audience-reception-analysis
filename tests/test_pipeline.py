@@ -175,7 +175,7 @@ def test_stage_2_analysis(mock_openrouter, mock_hdbscan):
     # Mock Chat Label return value
     mock_response = MagicMock()
     mock_choice = MagicMock()
-    mock_choice.message.content = '{"consolidated_tag": "Appreciation"}'
+    mock_choice.message.content = '{"consolidated_tag": "Appreciation", "explanation": "These reactions share appreciative responses to the relationship dynamic."}'
     mock_response.choices = [mock_choice]
     mock_client_instance.chat.send.return_value = mock_response
     
@@ -207,6 +207,7 @@ def test_stage_2_analysis(mock_openrouter, mock_hdbscan):
     with Session(test_engine) as session:
         annotation = session.get(Annotation, "post_test_2")
         assert annotation.consolidated_tag == "Appreciation"
+        assert annotation.cluster_explanation == "These reactions share appreciative responses to the relationship dynamic."
         assert annotation.cluster_id == 0
         assert annotation.embedding is not None
 
@@ -247,24 +248,26 @@ def test_visualizations(mock_handle_output):
         session.commit()
 
     from visualization import (
-        plot_semantic_map, plot_sentiment_by_theme,
+        plot_semantic_map, plot_sentiment_distribution, plot_sentiment_by_theme,
         plot_theme_dominance_bar, plot_theme_dominance_pareto
     )
     
     with Session(test_engine) as session:
         # Run all visualization functions (interactive / preview mode)
         plot_semantic_map(session)
+        plot_sentiment_distribution(session)
         plot_sentiment_by_theme(session)
         plot_theme_dominance_bar(session)
         plot_theme_dominance_pareto(session)
         
         # Run in export mode
         plot_semantic_map(session, save_path="plots/test_map.png")
+        plot_sentiment_distribution(session, save_path="plots/test_sentiment_distribution.png")
         plot_sentiment_by_theme(session, save_path="plots/test_sentiment.png")
         plot_theme_dominance_bar(session, save_path="plots/test_dominance_bar.png")
         plot_theme_dominance_pareto(session, save_path="plots/test_dominance_pareto.png")
 
-    assert mock_handle_output.call_count == 8
+    assert mock_handle_output.call_count == 10
 
 @patch("scraper.fetch_json")
 @patch("scraper.PlaywrightManager")

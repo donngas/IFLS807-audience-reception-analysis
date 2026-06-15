@@ -298,7 +298,7 @@ def run_interactive_wizard():
             min_size_val = 5
             force_embed_val = False
             force_cluster_val = False
-            sample_val = 10
+            sample_val = 15
             concurrency_val = 10
             
             adv = questionary.confirm("Configure advanced Stage 2 options?", default=False).ask()
@@ -406,7 +406,8 @@ def run_visualization_submenu():
     from database import engine
     from visualization import (
         plot_semantic_map, plot_sentiment_by_theme,
-        plot_theme_dominance_bar, plot_theme_dominance_pareto
+        plot_sentiment_distribution, plot_theme_dominance_bar,
+        plot_theme_dominance_pareto
     )
 
     while True:
@@ -414,14 +415,15 @@ def run_visualization_submenu():
             "Visualization Dashboard Options:",
             choices=[
                 "1. Semantic Map (2D t-SNE Plot of Embeddings)",
-                "2. Sentiment Distribution by Theme (Box Plot)",
-                "3. Theme Dominance (Bar Chart)",
-                "4. Theme Dominance (Pareto View)",
-                "5. Go Back"
+                "2. Sentiment Score Distribution",
+                "3. Sentiment Composition by Theme",
+                "4. Theme Dominance (Bar Chart)",
+                "5. Theme Dominance (Pareto View)",
+                "6. Go Back"
             ]
         ).ask()
         
-        if not vis_choice or vis_choice.startswith("5"):
+        if not vis_choice or vis_choice.startswith("6"):
             break
             
         action = questionary.select(
@@ -440,9 +442,10 @@ def run_visualization_submenu():
         if action.startswith("2"):
             default_map = {
                 "1": default_export_path("semantic_map", "png", "plots"),
-                "2": default_export_path("sentiment_by_theme", "png", "plots"),
-                "3": default_export_path("theme_dominance_bar", "png", "plots"),
-                "4": default_export_path("theme_dominance_pareto", "png", "plots")
+                "2": default_export_path("sentiment_distribution", "png", "plots"),
+                "3": default_export_path("sentiment_by_theme", "png", "plots"),
+                "4": default_export_path("theme_dominance_bar", "png", "plots"),
+                "5": default_export_path("theme_dominance_pareto", "png", "plots")
             }
             default_path = default_map.get(vis_choice[0], "plots/plot.png")
             save_path = questionary.text("Enter output image path:", default=default_path).ask()
@@ -454,10 +457,12 @@ def run_visualization_submenu():
                 if vis_choice.startswith("1"):
                     plot_semantic_map(session, save_path=save_path)
                 elif vis_choice.startswith("2"):
-                    plot_sentiment_by_theme(session, save_path=save_path)
+                    plot_sentiment_distribution(session, save_path=save_path)
                 elif vis_choice.startswith("3"):
-                    plot_theme_dominance_bar(session, save_path=save_path)
+                    plot_sentiment_by_theme(session, save_path=save_path)
                 elif vis_choice.startswith("4"):
+                    plot_theme_dominance_bar(session, save_path=save_path)
+                elif vis_choice.startswith("5"):
                     plot_theme_dominance_pareto(session, save_path=save_path)
             except Exception as e:
                 print(f"Error generating plot: {e}")
@@ -726,6 +731,7 @@ def manipulate_item(session, item, item_type):
             print(f"  Sentiment:        {ann.sentiment}")
             print(f"  Raw Tag:          {ann.raw_tag}")
             print(f"  Consolidated Tag: {ann.consolidated_tag}")
+            print(f"  Cluster Why:      {ann.cluster_explanation or 'N/A'}")
             print(f"  Cluster ID:       {ann.cluster_id}")
             print(f"  Summary:          {ann.summary}")
         else:
@@ -765,6 +771,7 @@ def manipulate_item(session, item, item_type):
             ).ask() or 0.0)
             new_raw_tag = questionary.text("Enter Raw Tag:", default=ann.raw_tag if ann else "").ask() or "Reaction Only"
             new_consolidated = questionary.text("Enter Consolidated Tag (Theme):", default=ann.consolidated_tag if ann else "").ask() or ""
+            new_explanation = questionary.text("Enter Cluster Explanation:", default=ann.cluster_explanation if ann and ann.cluster_explanation else "").ask() or ""
             
             if not ann:
                 ann = Annotation(
@@ -773,12 +780,14 @@ def manipulate_item(session, item, item_type):
                     sentiment=new_sentiment,
                     raw_tag=new_raw_tag,
                     consolidated_tag=new_consolidated or None,
+                    cluster_explanation=new_explanation or None,
                     summary="Manually annotated"
                 )
             else:
                 ann.sentiment = new_sentiment
                 ann.raw_tag = new_raw_tag
                 ann.consolidated_tag = new_consolidated or None
+                ann.cluster_explanation = new_explanation or None
                 ann.summary = ann.summary or "Manually edited"
                 
             upsert_annotation(session, ann)
@@ -848,6 +857,7 @@ def manipulate_items_bulk(session, items, item_type):
         ).ask() or 0.0)
         new_raw_tag = questionary.text("Enter Raw Tag:").ask() or "Reaction Only"
         new_consolidated = questionary.text("Enter Consolidated Tag (Theme - leave blank if none):").ask() or ""
+        new_explanation = questionary.text("Enter Cluster Explanation (leave blank if none):").ask() or ""
         
         for item in items:
             session.add(item)
@@ -859,12 +869,14 @@ def manipulate_items_bulk(session, items, item_type):
                     sentiment=new_sentiment,
                     raw_tag=new_raw_tag,
                     consolidated_tag=new_consolidated or None,
+                    cluster_explanation=new_explanation or None,
                     summary="Bulk manually annotated"
                 )
             else:
                 ann.sentiment = new_sentiment
                 ann.raw_tag = new_raw_tag
                 ann.consolidated_tag = new_consolidated or None
+                ann.cluster_explanation = new_explanation or None
                 ann.summary = "Bulk manually edited"
             
             upsert_annotation(session, ann)

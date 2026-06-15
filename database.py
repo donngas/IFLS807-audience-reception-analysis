@@ -1,6 +1,7 @@
 import os
 from typing import Optional, List
 from sqlmodel import Field, SQLModel, Session, create_engine, select, func
+from sqlalchemy import inspect, text
 from dotenv import load_dotenv
 
 # Load environment variables at module import time
@@ -32,6 +33,7 @@ class Annotation(SQLModel, table=True):
     summary: str
     raw_tag: str
     consolidated_tag: Optional[str] = Field(default=None, nullable=True)
+    cluster_explanation: Optional[str] = Field(default=None, nullable=True)
     cluster_id: Optional[int] = Field(default=None, nullable=True)
     embedding: Optional[str] = Field(default=None, description="JSON serialized array of floats")
 
@@ -44,6 +46,17 @@ engine = create_engine(sqlite_url, echo=False)
 
 def init_db():
     SQLModel.metadata.create_all(engine)
+    ensure_annotation_schema()
+
+def ensure_annotation_schema():
+    """Add nullable columns introduced after the first workspace schema."""
+    inspector = inspect(engine)
+    if "annotation" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("annotation")}
+    with engine.begin() as conn:
+        if "cluster_explanation" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN cluster_explanation VARCHAR"))
 
 def get_session():
     with Session(engine) as session:
@@ -133,6 +146,7 @@ def clear_stage_2_clustering(session: Session):
     for ann in annotations:
         ann.cluster_id = None
         ann.consolidated_tag = None
+        ann.cluster_explanation = None
         session.add(ann)
     session.commit()
 

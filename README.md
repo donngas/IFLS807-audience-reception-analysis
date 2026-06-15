@@ -69,6 +69,7 @@ erDiagram
         string summary
         string raw_tag
         string consolidated_tag "nullable"
+        string cluster_explanation "nullable"
         int cluster_id "nullable"
         string embedding "nullable"
     }
@@ -124,14 +125,15 @@ Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a h
 1. **Embedding Generation**: Combines the raw tag and summary for each annotation and retrieves semantic embedding vectors concurrently using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Stage 2 uses 10 concurrent OpenRouter requests by default with retry/backoff handling for transient rate-limit-like errors. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
 2. **Density-Based Clustering**: Runs `sklearn.cluster.HDBSCAN` on the normalized embedding vectors. This groups similar raw tags based on density and labels outliers as `-1` (noise).
 3. **Outlier Resolution**: For points marked as noise (`-1`), calculates their cosine similarity to the computed centroid of each valid cluster. Reassigns each outlier to its closest matching cluster centroid.
-4. **Cluster Labeling**: Takes the top $k$ (default 10) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels. Labels are cleaned to remove control characters and generic placeholders before being saved.
+4. **Cluster Labeling**: Takes the top $k$ (default 15) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels plus a one- or two-sentence explanation for why the label fits. Labels are cleaned to remove control characters and generic placeholders before being saved.
 5. **Update**: Automatically propagates the new consolidated labels and cluster IDs to the database.
 
 ### 4. Visualizations & Analytics (`visualization.py`)
 
 Provides rich analytical plots to explore processed data:
 - **Semantic Mapping (t-SNE)**: Projects high-dimensional tag/summary embeddings to a 2D space, colored by their consolidated theme, to inspect cluster density and semantic boundaries.
-- **Sentiment by Theme**: Displays box plots of sentiment distribution per consolidated tag (ordered by count).
+- **Sentiment Score Distribution**: Shows the five discrete sentiment scores as relative grouped bars for all items, posts, and comments.
+- **Sentiment Composition by Theme**: Shows each theme as a normalized stacked bar so sentiment mix can be compared across clusters.
 - **Theme Dominance Bar Chart**: Compares consolidated theme volume with percentage labels for quick cluster-size comparison.
 - **Theme Dominance Pareto View**: Combines theme counts with cumulative share to show whether a few clusters dominate the dataset.
 
