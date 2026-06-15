@@ -13,6 +13,10 @@ from database import (
 from scraper import scrape_reddit
 from analyzer import run_stage_1_analysis, run_stage_2_analysis
 from util import export_to_csv, export_to_json, print_stats
+from visualization import (
+    plot_semantic_map, plot_sentiment_by_theme,
+    plot_theme_trends_over_time, plot_subreddit_theme_distribution
+)
 
 def main():
     load_dotenv()
@@ -67,7 +71,7 @@ def main():
         
     elif args.action == "cluster":
         print("Starting Stage 2 Analysis (Semantic Embedding Clustering)...")
-        run_stage_2_analysis(embedding_model=args.embed_model, labeling_model=args.model or "google/gemini-2.5-flash", min_cluster_size=args.min_cluster_size, force_reembed=args.force_reembed, force_recluster=args.force_recluster)
+        run_stage_2_analysis(embedding_model=args.embed_model, labeling_model=args.model or "google/gemma-4-26b-a4b-it", min_cluster_size=args.min_cluster_size, force_reembed=args.force_reembed, force_recluster=args.force_recluster)
         
     elif args.action == "export":
         if not args.output:
@@ -94,11 +98,12 @@ def run_interactive_wizard():
                 "4. View Database Records & Stats",
                 "5. Manage / Reset Database Records",
                 "6. Export data to CSV/JSON",
-                "7. Exit"
+                "7. Run Visualizations & Dashboards",
+                "8. Exit"
             ]
         ).ask()
         
-        if not choice or choice.startswith("7"):
+        if not choice or choice.startswith("8"):
             print("Exiting pipeline. Goodbye!")
             break
             
@@ -133,7 +138,7 @@ def run_interactive_wizard():
             force_val = False
             adv = questionary.confirm("Configure advanced Stage 1 options?", default=False).ask()
             if adv:
-                model_val = questionary.text("OpenRouter Model:", default="google/gemini-2.5-flash").ask()
+                model_val = questionary.text("OpenRouter Model:", default="google/gemma-4-26b-a4b-it").ask()
                 limit_val = int(questionary.text("Batch limit (max items to process):", default="100").ask())
                 temp_val = float(questionary.text("LLM Temperature:", default="0.1").ask())
                 force_val = questionary.confirm("Force re-analyze already processed items?", default=False).ask()
@@ -144,7 +149,7 @@ def run_interactive_wizard():
         elif choice.startswith("3"):
             # Default or Advanced Stage 2
             embed_val = "sentence-transformers/all-minilm-l12-v2"
-            label_val = "google/gemini-2.5-flash"
+            label_val = "google/gemma-4-26b-a4b-it"
             min_size_val = 5
             force_embed_val = False
             force_cluster_val = False
@@ -209,6 +214,9 @@ def run_interactive_wizard():
                 export_to_csv(out_path)
             else:
                 export_to_json(out_path)
+                
+        elif choice.startswith("7"):
+            run_visualization_submenu()
 
 def run_db_management_submenu():
     while True:
@@ -258,6 +266,62 @@ def run_db_management_submenu():
                 if confirm:
                     nuke_database(session)
                     print("Database nuked. All records deleted.")
+
+def run_visualization_submenu():
+    while True:
+        vis_choice = questionary.select(
+            "Visualization Dashboard Options:",
+            choices=[
+                "1. Semantic Map (2D t-SNE Plot of Embeddings)",
+                "2. Sentiment Distribution by Theme (Box Plot)",
+                "3. Theme Trends Over Time (Line Plot)",
+                "4. Subreddit Theme Distribution (Stacked Bar Plot)",
+                "5. Go Back"
+            ]
+        ).ask()
+        
+        if not vis_choice or vis_choice.startswith("5"):
+            break
+            
+        action = questionary.select(
+            "What would you like to do with this plot?",
+            choices=[
+                "1. Preview Plot (Display in window)",
+                "2. Export Plot (Save to image file)",
+                "3. Go Back"
+            ]
+        ).ask()
+        
+        if not action or action.startswith("3"):
+            continue
+            
+        save_path = None
+        if action.startswith("2"):
+            default_map = {
+                "1": "plots/semantic_map.png",
+                "2": "plots/sentiment_by_theme.png",
+                "3": "plots/theme_trends.png",
+                "4": "plots/subreddit_themes.png"
+            }
+            default_path = default_map.get(vis_choice[0], "plots/plot.png")
+            save_path = questionary.text("Enter output image path:", default=default_path).ask()
+            if not save_path:
+                continue
+                
+        with Session(engine) as session:
+            try:
+                if vis_choice.startswith("1"):
+                    plot_semantic_map(session, save_path=save_path)
+                elif vis_choice.startswith("2"):
+                    plot_sentiment_by_theme(session, save_path=save_path)
+                elif vis_choice.startswith("3"):
+                    bin_choice = questionary.select("Bin time by:", choices=["D (Day)", "W (Week)", "M (Month)"], default="W").ask()
+                    bin_choice = bin_choice[0] if bin_choice else "W"
+                    plot_theme_trends_over_time(session, save_path=save_path, bin_by=bin_choice)
+                elif vis_choice.startswith("4"):
+                    plot_subreddit_theme_distribution(session, save_path=save_path)
+            except Exception as e:
+                print(f"Error generating plot: {e}")
 
 if __name__ == "__main__":
     main()

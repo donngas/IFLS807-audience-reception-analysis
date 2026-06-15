@@ -37,7 +37,7 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
         raise ValueError("OPENROUTER_API_KEY environment variable is required for Stage 1 analysis.")
     
     if not model_name:
-        model_name = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+        model_name = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it")
     
     system_prompt = (
         "You are an expert audience reception analyst. Analyze the following Reddit text and extract "
@@ -134,7 +134,7 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
 
 def run_stage_2_analysis(
     embedding_model: str = "sentence-transformers/all-minilm-l12-v2",
-    labeling_model: str = "google/gemini-2.5-flash",
+    labeling_model: str = "google/gemma-4-26b-a4b-it",
     min_cluster_size: int = 5,
     min_samples: Optional[int] = None,
     force_reembed: bool = False,
