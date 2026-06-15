@@ -68,6 +68,8 @@ erDiagram
         float sentiment
         string summary
         string raw_tag
+        bool is_substantive
+        string reception_reason "nullable"
         string consolidated_tag "nullable"
         string cluster_explanation "nullable"
         int cluster_id "nullable"
@@ -84,7 +86,7 @@ erDiagram
 Both `Post` and `Comment` use a `status` field to manage pipeline progress and ensure idempotency:
 
 - **`pending`**: Scraped and stored, awaiting Stage 1 LLM inference.
-- **`processed`**: Stage 1 inference completed successfully, and sentiment, summary, and raw_tag are populated.
+- **`processed`**: Stage 1 inference completed successfully, and sentiment, summary, substance classification, and tags are populated.
 - **`failed`**: The LLM returned unparseable output or timed out repeatedly. Kept in the DB to avoid infinite retries.
 - **`skipped`**: Marked for exclusion (e.g. if the post has no body text, if a comment is too brief, or if it is filtered out as low-substance noise).
 
@@ -106,6 +108,7 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
   - Comments authored by `"AutoModerator"` (or other common bots)
   - Empty items or items containing only image links.
 - Persists data directly to SQLite, checking for existing IDs to avoid duplicate API calls.
+- **Multi-job Runner**: In the interactive wizard, the first three pipeline steps can be selected together. The wizard gathers each selected job's configuration up front using the same prompts as the individual menu items, then runs acquisition, Stage 1, and Stage 2 automatically in order.
 
 ### 2. Stage 1: Feature Extraction (`analyzer.py`)
 
@@ -114,18 +117,20 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 - Structured JSON fields:
   - **sentiment**: A discrete numeric score representing sentiment polarity, restricted to exactly: `[-1.0, -0.5, 0.0, 0.5, 1.0]` (Strongly Negative, Negative, Neutral/Mixed, Positive, Strongly Positive).
   - **summary**: A concise 1-2 sentence summarization.
-  - **raw_tag**: A single primary descriptive tag (typically 2-5 words, e.g., `"earned emotional payoff"`, `"forced conflict writing"`, `"chemistry through banter"`). If the content has no meaningful theme (e.g., simple memes, expressions, or low-substance content), the model returns `"Reaction Only"`.
-- **Substance Check Guideline**: The LLM prompt contains a gentle guideline suggesting that if a post/comment contains less than 15 characters or lacks analytical substance, it should be categorized with `"Reaction Only"` as the tag.
+  - **is_substantive**: Whether the text gives a specific why/how reason for liking, disliking, defending, criticizing, or interpreting the couple.
+  - **reception_reason**: A concise 2-6 word reason for the reception when the text is substantive.
+  - **raw_tag**: A single primary descriptive tag (typically 2-5 words, e.g., `"earned emotional payoff"`, `"forced conflict writing"`, `"chemistry through banter"`). If the content has no meaningful reception reason, the model returns `"Reaction Only"`.
+- **Substance Check Guideline**: The LLM prompt now treats affect-only responses more strictly. Short or long text can be marked non-substantive when it only expresses intensity, excitement, dislike, shipping, meme-like reaction, or parasocial attachment without a concrete cause.
 - On success, updates the item's status to `processed`. On repeated failures, sets status to `failed`.
 
 ### 3. Stage 2: Thematic Clustering (`analyzer.py`)
 
 Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a hybrid semantic clustering pipeline:
 
-1. **Embedding Generation**: Combines the raw tag and summary for each annotation and retrieves semantic embedding vectors concurrently using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Stage 2 uses 10 concurrent OpenRouter requests by default with retry/backoff handling for transient rate-limit-like errors. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
+1. **Embedding Generation**: Excludes non-substantive `"Reaction Only"` annotations, then combines reception reason, raw tag, and summary for each remaining annotation and retrieves semantic embedding vectors concurrently using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Stage 2 uses 10 concurrent OpenRouter requests by default with retry/backoff handling for transient rate-limit-like errors. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
 2. **Density-Based Clustering**: Runs `sklearn.cluster.HDBSCAN` on the normalized embedding vectors. This groups similar raw tags based on density and labels outliers as `-1` (noise).
 3. **Outlier Resolution**: For points marked as noise (`-1`), calculates their cosine similarity to the computed centroid of each valid cluster. Reassigns each outlier to its closest matching cluster centroid.
-4. **Cluster Labeling**: Takes the top $k$ (default 15) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels plus a one- or two-sentence explanation for why the label fits. Labels are cleaned to remove control characters and generic placeholders before being saved.
+4. **Cluster Labeling**: Takes the top $k$ (default 15) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels plus a one- or two-sentence explanation for why the label fits. Labels are prompted to describe the concrete reception reason, not merely emotional engagement, and are cleaned to remove control characters and generic placeholders before being saved.
 5. **Update**: Automatically propagates the new consolidated labels and cluster IDs to the database.
 
 ### 4. Visualizations & Analytics (`visualization.py`)
@@ -136,6 +141,7 @@ Provides rich analytical plots to explore processed data:
 - **Sentiment Composition by Theme**: Shows each theme as a normalized stacked bar so sentiment mix can be compared across clusters.
 - **Theme Dominance Bar Chart**: Compares consolidated theme volume with percentage labels for quick cluster-size comparison.
 - **Theme Dominance Pareto View**: Combines theme counts with cumulative share to show whether a few clusters dominate the dataset.
+- Theme-level views exclude non-substantive `"Reaction Only"` annotations by default so they focus on interpretable reception reasons.
 
 Every plot supports either interactive preview windows or high-resolution PNG exports. Default export filenames include the active workspace and visualization type, such as `plots/jake_amy_semantic_map.png`.
 
