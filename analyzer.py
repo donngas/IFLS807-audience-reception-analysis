@@ -51,37 +51,49 @@ class ClusterLabelOutput(BaseModel):
     )
 
 
-STAGE_1_SYSTEM_PROMPT = (
-    "You are an expert audience reception analyst specializing in how viewers discuss "
-    "serialized television relationships on Reddit. Analyze the given text and extract "
-    "sentiment, a concise summary, whether the text is analytically substantive, "
-    "and the specific reception reason when one exists.\n\n"
-    "SENTIMENT — You MUST choose exactly one of these five values:\n"
-    "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
-    "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
-    "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
-    "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
-    "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
-    "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point. "
-    "If the text only expresses affect, say that it expresses a reaction without a specific reason.\n\n"
-    "SUBSTANCE CHECK — Set is_substantive to true ONLY if the text states or strongly implies "
-    "a specific why/how reason for liking, disliking, defending, criticizing, or interpreting the couple. "
-    "If the text merely expresses intensity, affection, dislike, excitement, sadness, shipping, "
-    "parasocial attachment, or a meme-like reaction without a concrete reason, set is_substantive=false.\n\n"
-    "RECEPTION REASON / RAW TAG — If is_substantive=true, provide a neutral 2-6 word "
-    "reception_reason and matching raw_tag that capture the specific reason behind the reaction. "
-    "Prefer tags like "
-    "'earned emotional payoff', 'forced conflict writing', 'supportive partner dynamic', "
-    "'inconsistent character motivation', or 'chemistry through banter' over generic tags "
-    "like 'character behavior', 'character analysis', or 'relationship opinion'. "
-    "Do not invent reasons that are not stated or strongly implied.\n\n"
-    "If is_substantive=false, set reception_reason=null and raw_tag='Reaction Only'. "
-    "Do not turn mere intensity, attachment, or enthusiasm into a substantive tag unless "
-    "the text gives a concrete cause for that reaction.\n\n"
-    "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
-    '{"sentiment": <float>, "summary": "<string>", "is_substantive": <bool>, '
-    '"reception_reason": <string|null>, "raw_tag": "<string>"}'
-)
+def get_stage_1_system_prompt(target_subject: Optional[str] = None) -> str:
+    prompt = (
+        "You are an expert audience reception analyst specializing in how viewers discuss "
+        "serialized television relationships on Reddit. Analyze the given text and extract "
+        "sentiment, a concise summary, whether the text is analytically substantive, "
+        "and the specific reception reason when one exists.\n\n"
+    )
+    
+    if target_subject:
+        prompt += (
+            f"TARGET SUBJECT FILTERING — You MUST evaluate if the text is primarily discussing '{target_subject}'. "
+            f"If the text is off-topic (e.g., discussing a completely different character, couple, or unrelated subject), "
+            f"you must set is_substantive=false, reception_reason=null, and raw_tag='Off Topic'.\n\n"
+        )
+
+    prompt += (
+        "SENTIMENT — You MUST choose exactly one of these five values:\n"
+        "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
+        "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
+        "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
+        "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
+        "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
+        "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point. "
+        "If the text only expresses affect, say that it expresses a reaction without a specific reason.\n\n"
+        "SUBSTANCE CHECK — Set is_substantive to true ONLY if the text states or strongly implies "
+        "a specific why/how reason for liking, disliking, defending, criticizing, or interpreting the couple. "
+        "If the text merely expresses intensity, affection, dislike, excitement, sadness, shipping, "
+        "parasocial attachment, or a meme-like reaction without a concrete reason, set is_substantive=false.\n\n"
+        "RECEPTION REASON / RAW TAG — If is_substantive=true, provide a neutral 2-6 word "
+        "reception_reason and matching raw_tag that capture the specific reason behind the reaction. "
+        "Prefer tags like "
+        "'earned emotional payoff', 'forced conflict writing', 'supportive partner dynamic', "
+        "'inconsistent character motivation', or 'chemistry through banter' over generic tags "
+        "like 'character behavior', 'character analysis', or 'relationship opinion'. "
+        "Do not invent reasons that are not stated or strongly implied.\n\n"
+        "If is_substantive=false, set reception_reason=null and raw_tag='Reaction Only' (or 'Off Topic' if filtering applies). "
+        "Do not turn mere intensity, attachment, or enthusiasm into a substantive tag unless "
+        "the text gives a concrete cause for that reaction.\n\n"
+        "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
+        '{"sentiment": <float>, "summary": "<string>", "is_substantive": <bool>, '
+        '"reception_reason": <string|null>, "raw_tag": "<string>"}'
+    )
+    return prompt
 
 SENTIMENT_VALUES = [-1.0, -0.5, 0.0, 0.5, 1.0]
 OPENROUTER_RETRY_ATTEMPTS = 3
@@ -165,10 +177,10 @@ def normalize_substance_fields(output: Stage1Output) -> Stage1Output:
     raw_tag = clean_label_text(output.raw_tag)
     is_substantive = bool(output.is_substantive)
 
-    if not is_substantive or not reason or raw_tag.lower() == "reaction only":
+    if not is_substantive or not reason or raw_tag.lower() in ("reaction only", "off topic"):
         output.is_substantive = False
         output.reception_reason = None
-        output.raw_tag = "Reaction Only"
+        output.raw_tag = "Off Topic" if raw_tag.lower() == "off topic" else "Reaction Only"
         return output
 
     output.reception_reason = reason
@@ -256,6 +268,7 @@ def analyze_stage_1_item(
     openrouter_api_key: str,
     model_name: str,
     temperature: float,
+    target_subject: Optional[str] = None,
 ) -> Stage1Result:
     try:
         def request():
@@ -263,7 +276,7 @@ def analyze_stage_1_item(
                 return client.chat.send(
                     model=model_name,
                     messages=[
-                        {"role": "system", "content": STAGE_1_SYSTEM_PROMPT},
+                        {"role": "system", "content": get_stage_1_system_prompt(target_subject)},
                         {"role": "user", "content": item.text}
                     ],
                     temperature=temperature
@@ -292,6 +305,7 @@ async def run_stage_1_item_batch(
     model_name: str,
     temperature: float,
     concurrency: int,
+    target_subject: Optional[str],
     desc: str,
 ) -> List[Stage1Result]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -304,6 +318,7 @@ async def run_stage_1_item_batch(
                 openrouter_api_key,
                 model_name,
                 temperature,
+                target_subject,
             )
 
     tasks = [asyncio.create_task(run_one(item)) for item in items]
@@ -421,10 +436,11 @@ async def run_stage_2_label_batch(
 
 
 def run_stage_1_analysis(
-    model_name: Optional[str] = None,
+    model_name: str = "google/gemini-2.5-flash",
     temperature: float = 0.1,
     force_reanalyze: bool = False,
-    concurrency: int = 10
+    concurrency: int = 20,
+    target_subject: Optional[str] = None,
 ):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_api_key:
@@ -465,6 +481,7 @@ def run_stage_1_analysis(
             model_name,
             temperature,
             concurrency,
+            target_subject,
             "Analyzing Posts",
         )
     )
@@ -477,6 +494,7 @@ def run_stage_1_analysis(
             model_name,
             temperature,
             concurrency,
+            target_subject,
             "Analyzing Comments",
         )
     )

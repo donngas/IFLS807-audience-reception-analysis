@@ -138,6 +138,9 @@ def configure_stage_1_job():
     temp_val = 0.1
     concurrency_val = 10
     force_val = False
+    
+    target_subject_val = questionary.text("Enter the target subject (e.g., 'Marshall and Lily') to filter off-topic comments (leave blank to skip):").ask()
+    
     adv = questionary.confirm("Configure advanced Stage 1 options?", default=False).ask()
     if adv:
         model_val = questionary.text("OpenRouter Model:", default="google/gemma-4-26b-a4b-it").ask()
@@ -151,6 +154,7 @@ def configure_stage_1_job():
         "temperature": temp_val,
         "force_reanalyze": bool(force_val),
         "concurrency": concurrency_val,
+        "target_subject": target_subject_val or None,
     }
 
 
@@ -206,6 +210,7 @@ def run_pipeline_job(job, scrape_reddit, run_stage_1_analysis, run_stage_2_analy
             temperature=job["temperature"],
             force_reanalyze=job["force_reanalyze"],
             concurrency=job["concurrency"],
+            target_subject=job.get("target_subject"),
         )
     elif job["type"] == "stage2":
         print("Starting Stage 2 Analysis (Thematic Clustering)...")

@@ -158,6 +158,42 @@ def test_stage_1_analysis(mock_openrouter):
         assert annotation.cluster_id is None
         assert annotation.embedding is None
 
+@patch("analyzer.OpenRouter")
+@patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
+def test_stage_1_analysis_off_topic_filter(mock_openrouter):
+    mock_client_instance = MagicMock()
+    mock_openrouter.return_value.__enter__.return_value = mock_client_instance
+    
+    mock_response = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = (
+        '{"sentiment": 0.0, "summary": "Discusses a different character.", '
+        '"is_substantive": false, "reception_reason": null, '
+        '"raw_tag": "Off Topic"}'
+    )
+    mock_response.choices = [mock_choice]
+    mock_client_instance.chat.send.return_value = mock_response
+    
+    with Session(test_engine) as session:
+        p = Post(id="post_test_off_topic", subreddit="test", title="T", selftext="S", score=1, created_utc=0.0)
+        session.add(p)
+        session.commit()
+    
+    from analyzer import run_stage_1_analysis
+    run_stage_1_analysis(target_subject="Marshall and Lily")
+    
+    with Session(test_engine) as session:
+        post = session.get(Post, "post_test_off_topic")
+        assert post.status == "processed"
+        
+        annotation = session.get(Annotation, "post_test_off_topic")
+        assert annotation is not None
+        assert annotation.item_type == "post"
+        assert annotation.raw_tag == "Off Topic"
+        assert annotation.is_substantive is False
+        assert annotation.reception_reason is None
+
+
 @patch("analyzer.HDBSCAN")
 @patch("analyzer.OpenRouter")
 @patch.dict('os.environ', {"OPENROUTER_API_KEY": "test_key"})
