@@ -96,6 +96,8 @@ def load_annotation_dataframe(session: Session) -> pd.DataFrame:
             "sentiment": ann.sentiment,
             "summary": ann.summary,
             "raw_tag": ann.raw_tag,
+            "is_substantive": ann.is_substantive,
+            "reception_reason": ann.reception_reason,
             "consolidated_tag": clean_plot_label(ann.consolidated_tag),
             "cluster_id": ann.cluster_id if ann.cluster_id is not None else -1,
             "embedding": ann.embedding
@@ -132,7 +134,7 @@ def plot_semantic_map(session: Session, save_path: Optional[str] = None):
         return
         
     # Filter for items with embeddings
-    df_valid = df[df["embedding"].notna()].copy()
+    df_valid = df[(df["embedding"].notna()) & (df["is_substantive"]) & (df["consolidated_tag"] != "Unclustered")].copy()
     if len(df_valid) < 2:
         print("Need at least 2 annotated items with embeddings to generate a semantic map.")
         return
@@ -178,7 +180,7 @@ def plot_sentiment_by_theme(session: Session, save_path: Optional[str] = None):
         return
         
     # Filter for processed items
-    df_valid = df[df["consolidated_tag"].notna()].copy()
+    df_valid = df[(df["is_substantive"]) & (df["consolidated_tag"] != "Unclustered")].copy()
     if df_valid.empty:
         print("No annotated items found to show theme sentiment distributions.")
         return
@@ -274,6 +276,7 @@ def plot_theme_dominance_bar(session: Session, save_path: Optional[str] = None, 
         print("No data available to plot.")
         return
 
+    df = df[(df["is_substantive"]) & (df["consolidated_tag"] != "Unclustered")].copy()
     counts = df["consolidated_tag"].value_counts()
     if counts.empty:
         print("No clustered themes available to plot.")
@@ -312,6 +315,7 @@ def plot_theme_dominance_pareto(session: Session, save_path: Optional[str] = Non
         print("No data available to plot.")
         return
 
+    df = df[(df["is_substantive"]) & (df["consolidated_tag"] != "Unclustered")].copy()
     counts = df["consolidated_tag"].value_counts().head(top_n)
     if counts.empty:
         print("No clustered themes available to plot.")

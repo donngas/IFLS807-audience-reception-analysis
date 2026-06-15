@@ -38,6 +38,8 @@ def get_joined_data(session: Session):
             "sentiment": annotation.sentiment,
             "summary": annotation.summary,
             "raw_tag": annotation.raw_tag,
+            "is_substantive": annotation.is_substantive,
+            "reception_reason": annotation.reception_reason,
             "consolidated_tag": annotation.consolidated_tag,
             "cluster_explanation": annotation.cluster_explanation
         })
@@ -54,6 +56,8 @@ def get_joined_data(session: Session):
             "sentiment": annotation.sentiment,
             "summary": annotation.summary,
             "raw_tag": annotation.raw_tag,
+            "is_substantive": annotation.is_substantive,
+            "reception_reason": annotation.reception_reason,
             "consolidated_tag": annotation.consolidated_tag,
             "cluster_explanation": annotation.cluster_explanation
         })
@@ -133,10 +137,21 @@ def print_sentiment_distribution(distribution: dict[str, dict[float, int]]):
             values = ", ".join(f"{bucket:g}: 0 (0.0%)" for bucket in SENTIMENT_BUCKETS)
         print(f"  {item_type.title():<7} ({item_total}): {values}")
 
+def get_substance_distribution(session: Session) -> dict[str, int]:
+    rows = session.exec(select(Annotation.is_substantive)).all()
+    substantive = sum(1 for value in rows if value)
+    reaction_only = len(rows) - substantive
+    return {
+        "substantive": substantive,
+        "reaction_only": reaction_only,
+        "total": len(rows),
+    }
+
 def print_stats():
     with Session(engine) as session:
         stats = get_statistics(session)
         sentiment_distribution = get_sentiment_distribution(session)
+        substance_distribution = get_substance_distribution(session)
         
     print("\n--- Pipeline Statistics ---")
     print("\nPost Status Counts:")
@@ -149,5 +164,12 @@ def print_stats():
         
     print(f"\nAverage Post Sentiment: {stats.get('average_post_sentiment')}")
     print(f"Average Comment Sentiment: {stats.get('average_comment_sentiment')}")
+    total_substance = substance_distribution["total"]
+    print("\nSubstance Classification:")
+    if total_substance:
+        print(f"  Substantive:   {substance_distribution['substantive']} ({substance_distribution['substantive'] / total_substance * 100:.1f}%)")
+        print(f"  Reaction Only: {substance_distribution['reaction_only']} ({substance_distribution['reaction_only'] / total_substance * 100:.1f}%)")
+    else:
+        print("  No annotations available yet.")
     print_sentiment_distribution(sentiment_distribution)
     print("---------------------------\n")
