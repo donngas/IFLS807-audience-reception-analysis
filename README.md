@@ -99,7 +99,7 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 - Queries designated subreddits using Reddit's search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
 - **Query Translation**: Since custom queries might be entered using curly braces (e.g. `{Jake AND Amy}`), the scraper automatically normalizes these to standard parenthetical expressions (e.g. `(Jake AND Amy)`) before sending them to PRAW.
 - **Ordering**: Results are sorted by configurable parameters (such as `top`, `hot`, `new`, `relevance`) with a time filter (such as `all`, `year`, `month`, `week`, `day`).
-- **Scrape Volume**: Scrapes 50 usable posts per query by default and up to 50 top-level comments per post. By default, acquisition keeps fetching additional search results until the saved usable posts reach the requested post limit, when enough results are available. Use `--no-fill-post-limit` to treat the post limit as the number of search candidates to try instead.
+- **Scrape Volume**: Scrapes 50 usable posts per query by default and up to 25 top-level comments per post. By default, acquisition keeps fetching additional search results until the saved usable posts reach the requested post limit, when enough results are available. Use `--no-fill-post-limit` to treat the post limit as the number of search candidates to try instead.
 - **Filtering Noise**: Automatically ignores or marks as `skipped` on scraping:
   - Comments where the body is `"[deleted]"` or `"[removed]"`
   - Comments authored by `"AutoModerator"` (or other common bots)
@@ -108,7 +108,7 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 
 ### 2. Stage 1: Feature Extraction (`analyzer.py`)
 
-- Performs concurrent LLM inference on all posts and top-level comments marked as `pending`.
+- Performs concurrent LLM inference on all posts and top-level comments marked as `pending`, with 10 concurrent OpenRouter requests by default and retry/backoff handling for transient rate-limit-like errors.
 - Queries OpenRouter models (e.g. `google/gemma-4-26b-a4b-it`) to retrieve structured JSON. Enforces JSON schemas using Pydantic models.
 - Structured JSON fields:
   - **sentiment**: A discrete numeric score representing sentiment polarity, restricted to exactly: `[-1.0, -0.5, 0.0, 0.5, 1.0]` (Strongly Negative, Negative, Neutral/Mixed, Positive, Strongly Positive).
@@ -121,10 +121,10 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 
 Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a hybrid semantic clustering pipeline:
 
-1. **Embedding Generation**: Combines the raw tag and summary for each annotation and retrieves a semantic embedding vector using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
+1. **Embedding Generation**: Combines the raw tag and summary for each annotation and retrieves semantic embedding vectors concurrently using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Stage 2 uses 10 concurrent OpenRouter requests by default with retry/backoff handling for transient rate-limit-like errors. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
 2. **Density-Based Clustering**: Runs `sklearn.cluster.HDBSCAN` on the normalized embedding vectors. This groups similar raw tags based on density and labels outliers as `-1` (noise).
 3. **Outlier Resolution**: For points marked as noise (`-1`), calculates their cosine similarity to the computed centroid of each valid cluster. Reassigns each outlier to its closest matching cluster centroid.
-4. **Cluster Labeling**: Takes the top $k$ (default 10) representative annotations closest to each cluster's centroid and sends them to the LLM (e.g. `google/gemma-4-26b-a4b-it`) to generate a cohesive consolidated label (e.g. `"Character Chemistry"`, `"Dialogue Quality"`, `"Pacing Issues"`).
+4. **Cluster Labeling**: Takes the top $k$ (default 10) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels. Labels are cleaned to remove control characters and generic placeholders before being saved.
 5. **Update**: Automatically propagates the new consolidated labels and cluster IDs to the database.
 
 ### 4. Visualizations & Analytics (`visualization.py`)
@@ -132,10 +132,10 @@ Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a h
 Provides rich analytical plots to explore processed data:
 - **Semantic Mapping (t-SNE)**: Projects high-dimensional tag/summary embeddings to a 2D space, colored by their consolidated theme, to inspect cluster density and semantic boundaries.
 - **Sentiment by Theme**: Displays box plots of sentiment distribution per consolidated tag (ordered by count).
-- **Theme Trends Over Time**: Plots trend lines showing theme volume over time (configurable time bins).
-- **Subreddit Theme Distribution**: Shows stacked bar charts comparing theme composition across different subreddits.
+- **Theme Dominance Bar Chart**: Compares consolidated theme volume with percentage labels for quick cluster-size comparison.
+- **Theme Dominance Pareto View**: Combines theme counts with cumulative share to show whether a few clusters dominate the dataset.
 
-Every plot supports either interactive preview windows or high-resolution PNG exports.
+Every plot supports either interactive preview windows or high-resolution PNG exports. Default export filenames include the active workspace and visualization type, such as `plots/jake_amy_semantic_map.png`.
 
 ### 5. Utilities (`util.py`)
 

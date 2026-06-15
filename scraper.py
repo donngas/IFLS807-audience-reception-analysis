@@ -11,6 +11,7 @@ from tqdm import tqdm
 from database import Session, engine, Post, Comment, upsert_post, upsert_comment
 
 REDDIT_JSON_PAGE_LIMIT = 100
+REDDIT_BEST_COMMENT_SORT = "confidence"
 
 def get_praw_reddit():
     client_id = os.environ.get("REDDIT_CLIENT_ID")
@@ -144,6 +145,15 @@ def build_reddit_search_url(
     return f"https://www.reddit.com/search.json?{encoded_params}"
 
 
+def build_reddit_comments_url(post_id: str, comment_limit: int) -> str:
+    params = {
+        "limit": str(comment_limit),
+        # Reddit's JSON/API name for the default "best" comment sort is "confidence".
+        "sort": REDDIT_BEST_COMMENT_SORT,
+    }
+    return f"https://www.reddit.com/comments/{post_id}.json?{urllib.parse.urlencode(params)}"
+
+
 def extract_reddit_posts(payload: dict) -> tuple[List[dict], Optional[str]]:
     data = payload.get("data", {})
     raw_children = data.get("children", [])
@@ -225,7 +235,7 @@ def scrape_reddit(
     query: str, 
     subreddits: Optional[List[str]] = None, 
     post_limit: int = 50, 
-    comment_limit: int = 50, 
+    comment_limit: int = 25, 
     sort: str = "top", 
     time_filter: str = "all", 
     skip_existing: bool = True,
@@ -246,7 +256,7 @@ def scrape_reddit_praw(
     query: str, 
     subreddits: Optional[List[str]] = None, 
     post_limit: int = 50, 
-    comment_limit: int = 50, 
+    comment_limit: int = 25, 
     sort: str = "top", 
     time_filter: str = "all", 
     skip_existing: bool = True,
@@ -289,6 +299,7 @@ def scrape_reddit_praw(
             if post_status != "skipped":
                 usable_posts += 1
             
+            submission.comment_sort = REDDIT_BEST_COMMENT_SORT
             submission.comments.replace_more(limit=0)
             comments_fetched = 0
             for comment in submission.comments:
@@ -427,7 +438,7 @@ def save_json_comments(session, post_id: str, c_payload, comment_limit: int) -> 
 
 def fetch_comments_for_post(session, post_id: str, comment_limit: int, pw_manager: PlaywrightManager) -> int:
     """Fetch comments using direct JSON, Playwright, or PullPush fallback."""
-    comments_url = f"https://www.reddit.com/comments/{post_id}.json?limit={comment_limit}"
+    comments_url = build_reddit_comments_url(post_id, comment_limit)
     
     # 1. Direct JSON (curl_cffi)
     try:
@@ -506,7 +517,7 @@ def save_posts_from_batches(
 
 
 def fetch_comments_with_playwright_primary(session, post_id: str, comment_limit: int, pw_manager: PlaywrightManager) -> int:
-    comments_url = f"https://www.reddit.com/comments/{post_id}.json?limit={comment_limit}"
+    comments_url = build_reddit_comments_url(post_id, comment_limit)
     try:
         page = pw_manager.get_page()
         c_payload = fetch_json_playwright(page, comments_url)
@@ -520,7 +531,7 @@ def scrape_reddit_json(
     query: str, 
     subreddits: Optional[List[str]] = None, 
     post_limit: int = 50, 
-    comment_limit: int = 50, 
+    comment_limit: int = 25, 
     sort: str = "top", 
     time_filter: str = "all", 
     skip_existing: bool = True,
@@ -605,7 +616,7 @@ def scrape_reddit_playwright(
     query: str, 
     subreddits: Optional[List[str]] = None, 
     post_limit: int = 50, 
-    comment_limit: int = 50, 
+    comment_limit: int = 25, 
     sort: str = "top", 
     time_filter: str = "all", 
     skip_existing: bool = True,
@@ -664,7 +675,8 @@ def scrape_reddit_playwright(
 
 def fetch_comments_pullpush(session, post_id: str, comment_limit: int) -> int:
     """Helper to fetch comments for a submission from PullPush API."""
-    comments_url = f"https://api.pullpush.io/reddit/search/comment/?link_id=t3_{post_id}&size={comment_limit}"
+    # PullPush does not expose Reddit's confidence/"best" ranking; score-desc is the closest available proxy.
+    comments_url = f"https://api.pullpush.io/reddit/search/comment/?link_id=t3_{post_id}&size={comment_limit}&sort_type=score&sort=desc"
     try:
         c_payload = fetch_json(comments_url, use_impersonation=False)
         comments = c_payload.get("data", [])

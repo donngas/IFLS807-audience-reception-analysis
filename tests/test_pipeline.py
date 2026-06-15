@@ -36,6 +36,40 @@ def test_is_low_quality():
     assert is_low_quality("RealUser", "[removed]") == True
     assert is_low_quality("RealUser", "Good text") == False
 
+def test_stage_2_label_cleanup_rejects_corrupt_cluster_label():
+    from analyzer import clean_label_text, fallback_cluster_label, is_generic_cluster_label
+
+    assert clean_label_text("Cluster 12\x00\x00") == "Cluster 12"
+    assert is_generic_cluster_label("Cluster 12\x00\x00") is True
+
+    annotations = [
+        Annotation(
+            item_id="ann_cleanup_1",
+            item_type="post",
+            sentiment=0.5,
+            summary="Viewers liked the gradual romantic buildup.",
+            raw_tag="earned romantic buildup",
+        )
+    ]
+    assert fallback_cluster_label(annotations) == "earned romantic buildup"
+
+def test_openrouter_retry_helper_retries_rate_limit_errors():
+    from analyzer import run_openrouter_with_retries
+
+    calls = {"count": 0}
+
+    def flaky_operation():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise Exception("429 rate limit")
+        return "ok"
+
+    with patch("analyzer.time.sleep") as mock_sleep:
+        assert run_openrouter_with_retries(flaky_operation, "test request") == "ok"
+
+    assert calls["count"] == 2
+    mock_sleep.assert_called_once()
+
 @patch("scraper.get_praw_reddit")
 def test_scrape_reddit_mock(mock_get_reddit):
     # Mock PRAW
@@ -71,6 +105,7 @@ def test_scrape_reddit_mock(mock_get_reddit):
     from scraper import scrape_reddit
     # We do a tiny scrape
     scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1)
+    assert mock_submission.comment_sort == "confidence"
     
     # Check DB
     with Session(test_engine) as session:
@@ -213,21 +248,21 @@ def test_visualizations(mock_handle_output):
 
     from visualization import (
         plot_semantic_map, plot_sentiment_by_theme,
-        plot_theme_trends_over_time, plot_subreddit_theme_distribution
+        plot_theme_dominance_bar, plot_theme_dominance_pareto
     )
     
     with Session(test_engine) as session:
         # Run all visualization functions (interactive / preview mode)
         plot_semantic_map(session)
         plot_sentiment_by_theme(session)
-        plot_theme_trends_over_time(session)
-        plot_subreddit_theme_distribution(session)
+        plot_theme_dominance_bar(session)
+        plot_theme_dominance_pareto(session)
         
         # Run in export mode
         plot_semantic_map(session, save_path="plots/test_map.png")
         plot_sentiment_by_theme(session, save_path="plots/test_sentiment.png")
-        plot_theme_trends_over_time(session, save_path="plots/test_trends.png")
-        plot_subreddit_theme_distribution(session, save_path="plots/test_subreddits.png")
+        plot_theme_dominance_bar(session, save_path="plots/test_dominance_bar.png")
+        plot_theme_dominance_pareto(session, save_path="plots/test_dominance_pareto.png")
 
     assert mock_handle_output.call_count == 8
 
@@ -288,6 +323,11 @@ def test_scrape_reddit_json_mock(mock_fetch_json_playwright, mock_playwright_man
         assert comment is not None
         assert comment.body == "Test Comment JSON"
 
+    pullpush_comment_urls = [call.args[0] for call in mock_fetch_json.call_args_list if "search/comment" in call.args[0]]
+    assert pullpush_comment_urls
+    assert "sort_type=score" in pullpush_comment_urls[0]
+    assert "sort=desc" in pullpush_comment_urls[0]
+
 
 @patch("scraper.fetch_json")
 @patch("scraper.PlaywrightManager")
@@ -346,6 +386,10 @@ def test_scrape_reddit_json_direct_success_mock(mock_fetch_json_playwright, mock
         comment = session.get(Comment, "direct_comment1")
         assert comment is not None
         assert comment.body == "Direct Comment Body"
+
+    comment_urls = [call.args[0] for call in mock_fetch_json.call_args_list if "/comments/" in call.args[0]]
+    assert comment_urls
+    assert "sort=confidence" in comment_urls[0]
 
 
 @patch("scraper.fetch_json")
@@ -544,5 +588,9 @@ def test_scrape_reddit_playwright_direct_mock(mock_fetch_json_playwright, mock_p
         comment = session.get(Comment, "pw_direct_comment1")
         assert comment is not None
         assert comment.body == "Playwright Direct Comment"
+
+    comment_urls = [call.args[1] for call in mock_fetch_json_playwright.call_args_list if "/comments/" in call.args[1]]
+    assert comment_urls
+    assert "sort=confidence" in comment_urls[0]
 
 

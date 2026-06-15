@@ -1,8 +1,11 @@
 import os
 import asyncio
 import json
+import re
+import time
 from dataclasses import dataclass
-from typing import Literal, Optional, List
+from collections import Counter
+from typing import Callable, Literal, Optional, List
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 import numpy as np
@@ -61,6 +64,8 @@ STAGE_1_SYSTEM_PROMPT = (
 )
 
 SENTIMENT_VALUES = [-1.0, -0.5, 0.0, 0.5, 1.0]
+OPENROUTER_RETRY_ATTEMPTS = 3
+OPENROUTER_RETRY_BASE_DELAY = 2.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,35 @@ class Stage1Result:
     item_id: str
     item_type: Literal["post", "comment"]
     annotation: Optional[Annotation] = None
+    error: Optional[Exception] = None
+
+
+@dataclass(frozen=True)
+class Stage2EmbeddingItem:
+    item_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class Stage2EmbeddingResult:
+    item_id: str
+    embedding: Optional[List[float]] = None
+    error: Optional[Exception] = None
+
+
+@dataclass(frozen=True)
+class Stage2LabelItem:
+    cluster_id: int
+    prompt: str
+    fallback_label: str
+    item_count: int
+
+
+@dataclass(frozen=True)
+class Stage2LabelResult:
+    cluster_id: int
+    label: str
+    item_count: int
     error: Optional[Exception] = None
 
 
@@ -100,6 +134,62 @@ def normalize_stage_1_output(parsed_data: dict) -> Stage1Output:
     return Stage1Output.model_validate(parsed_data)
 
 
+def clean_label_text(label: Optional[str]) -> str:
+    if not label:
+        return ""
+    label = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(label))
+    label = re.sub(r"\s+", " ", label).strip(" \"'`.,;:-")
+    return label
+
+
+def is_generic_cluster_label(label: str) -> bool:
+    cleaned = clean_label_text(label).lower()
+    if not cleaned:
+        return True
+    return bool(re.fullmatch(r"cluster\s*[a-z0-9_-]*", cleaned))
+
+
+def fallback_cluster_label(annotations: List[Annotation]) -> str:
+    tags = [clean_label_text(ann.raw_tag) for ann in annotations if clean_label_text(ann.raw_tag)]
+    tags = [tag for tag in tags if tag.lower() != "reaction only"]
+    if not tags:
+        return "Reaction Only"
+    return Counter(tags).most_common(1)[0][0]
+
+
+def is_retryable_openrouter_error(error: Exception) -> bool:
+    message = str(error).lower()
+    retry_markers = [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "timeout",
+        "temporarily",
+        "connection",
+        "server error",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(marker in message for marker in retry_markers)
+
+
+def run_openrouter_with_retries(operation: Callable[[], object], context: str):
+    last_error = None
+    for attempt in range(1, OPENROUTER_RETRY_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as e:
+            last_error = e
+            if attempt >= OPENROUTER_RETRY_ATTEMPTS or not is_retryable_openrouter_error(e):
+                raise
+            delay = OPENROUTER_RETRY_BASE_DELAY * attempt
+            tqdm.write(f"{context}: retrying after transient OpenRouter error ({attempt}/{OPENROUTER_RETRY_ATTEMPTS}): {e}")
+            time.sleep(delay)
+    raise last_error
+
+
 def analyze_stage_1_item(
     item: Stage1Item,
     openrouter_api_key: str,
@@ -107,15 +197,18 @@ def analyze_stage_1_item(
     temperature: float,
 ) -> Stage1Result:
     try:
-        with OpenRouter(api_key=openrouter_api_key) as client:
-            response = client.chat.send(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": STAGE_1_SYSTEM_PROMPT},
-                    {"role": "user", "content": item.text}
-                ],
-                temperature=temperature
-            )
+        def request():
+            with OpenRouter(api_key=openrouter_api_key) as client:
+                return client.chat.send(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": STAGE_1_SYSTEM_PROMPT},
+                        {"role": "user", "content": item.text}
+                    ],
+                    temperature=temperature
+                )
+
+        response = run_openrouter_with_retries(request, f"Stage 1 {item.item_type} {item.item_id}")
         content = response.choices[0].message.content
         output = normalize_stage_1_output(parse_json_content(content))
         annotation = Annotation(
@@ -157,11 +250,111 @@ async def run_stage_1_item_batch(
     return results
 
 
+def generate_stage_2_embedding(
+    item: Stage2EmbeddingItem,
+    openrouter_api_key: str,
+    embedding_model: str,
+) -> Stage2EmbeddingResult:
+    try:
+        def request():
+            with OpenRouter(api_key=openrouter_api_key) as client:
+                return client.embeddings.generate(
+                    model=embedding_model,
+                    input=item.text
+                )
+
+        res = run_openrouter_with_retries(request, f"Stage 2 embedding {item.item_id}")
+        return Stage2EmbeddingResult(item_id=item.item_id, embedding=res.data[0].embedding)
+    except Exception as e:
+        return Stage2EmbeddingResult(item_id=item.item_id, error=e)
+
+
+async def run_stage_2_embedding_batch(
+    items: List[Stage2EmbeddingItem],
+    openrouter_api_key: str,
+    embedding_model: str,
+    concurrency: int,
+) -> List[Stage2EmbeddingResult]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(item: Stage2EmbeddingItem) -> Stage2EmbeddingResult:
+        async with semaphore:
+            return await asyncio.to_thread(
+                generate_stage_2_embedding,
+                item,
+                openrouter_api_key,
+                embedding_model,
+            )
+
+    tasks = [asyncio.create_task(run_one(item)) for item in items]
+    results = []
+    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Generating Embeddings"):
+        results.append(await task)
+    return results
+
+
+def label_stage_2_cluster(
+    item: Stage2LabelItem,
+    openrouter_api_key: str,
+    labeling_model: str,
+) -> Stage2LabelResult:
+    try:
+        def request():
+            with OpenRouter(api_key=openrouter_api_key) as client:
+                return client.chat.send(
+                    model=labeling_model,
+                    messages=[
+                        {"role": "user", "content": item.prompt}
+                    ],
+                    temperature=0.1
+                )
+
+        response = run_openrouter_with_retries(request, f"Stage 2 cluster {item.cluster_id}")
+        content = response.choices[0].message.content
+        parsed_data = parse_json_content(content)
+        output = ClusterLabelOutput.model_validate(parsed_data)
+        label = clean_label_text(output.consolidated_tag)
+        if is_generic_cluster_label(label):
+            label = item.fallback_label
+        return Stage2LabelResult(cluster_id=item.cluster_id, label=label, item_count=item.item_count)
+    except Exception as e:
+        return Stage2LabelResult(
+            cluster_id=item.cluster_id,
+            label=item.fallback_label,
+            item_count=item.item_count,
+            error=e,
+        )
+
+
+async def run_stage_2_label_batch(
+    items: List[Stage2LabelItem],
+    openrouter_api_key: str,
+    labeling_model: str,
+    concurrency: int,
+) -> List[Stage2LabelResult]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(item: Stage2LabelItem) -> Stage2LabelResult:
+        async with semaphore:
+            return await asyncio.to_thread(
+                label_stage_2_cluster,
+                item,
+                openrouter_api_key,
+                labeling_model,
+            )
+
+    tasks = [asyncio.create_task(run_one(item)) for item in items]
+    results = []
+    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Labeling Clusters"):
+        results.append(await task)
+    return results
+
+
 def run_stage_1_analysis(
     model_name: Optional[str] = None,
     temperature: float = 0.1,
     force_reanalyze: bool = False,
-    concurrency: int = 5
+    concurrency: int = 10
 ):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_api_key:
@@ -248,7 +441,8 @@ def run_stage_2_analysis(
     min_samples: Optional[int] = None,
     force_reembed: bool = False,
     force_recluster: bool = False,
-    label_sample_size: int = 10
+    label_sample_size: int = 10,
+    concurrency: int = 10
 ):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_api_key:
@@ -266,29 +460,40 @@ def run_stage_2_analysis(
         print(f"Stage 2: Found {len(annotations)} annotations in the database.")
         
         # 1. Generate Embeddings (checking cache)
-        with OpenRouter(api_key=openrouter_api_key) as client:
-            embeddings_needed = []
-            for ann in annotations:
-                if force_reembed or not ann.embedding:
-                    embeddings_needed.append(ann)
-            
-            if embeddings_needed:
-                print(f"Generating embeddings for {len(embeddings_needed)} annotations using {embedding_model}...")
-                for ann in tqdm(embeddings_needed, desc="Generating Embeddings"):
-                    combined_text = f"Tag: {ann.raw_tag} | Summary: {ann.summary}"
-                    try:
-                        res = client.embeddings.generate(
-                            model=embedding_model,
-                            input=combined_text
-                        )
-                        embedding_vector = res.data[0].embedding
-                        ann.embedding = json.dumps(embedding_vector)
-                        upsert_annotation(session, ann)
-                    except Exception as e:
-                        print(f"Failed to generate embedding for {ann.item_id}: {e}")
-                
-                # Reload annotations to ensure we have all embeddings
-                annotations = session.exec(annotations_stmt).all()
+        embeddings_needed = [
+            Stage2EmbeddingItem(
+                item_id=ann.item_id,
+                text=f"Tag: {ann.raw_tag} | Summary: {ann.summary}",
+            )
+            for ann in annotations
+            if force_reembed or not ann.embedding
+        ]
+
+        if embeddings_needed:
+            print(
+                f"Generating embeddings for {len(embeddings_needed)} annotations "
+                f"using {embedding_model} with concurrency {max(1, concurrency)}..."
+            )
+            embedding_results = asyncio.run(
+                run_stage_2_embedding_batch(
+                    embeddings_needed,
+                    openrouter_api_key,
+                    embedding_model,
+                    concurrency,
+                )
+            )
+            for result in embedding_results:
+                ann = session.get(Annotation, result.item_id)
+                if not ann:
+                    continue
+                if result.embedding:
+                    ann.embedding = json.dumps(result.embedding)
+                    upsert_annotation(session, ann)
+                elif result.error:
+                    print(f"Failed to generate embedding for {result.item_id}: {result.error}")
+
+            # Reload annotations to ensure we have all embeddings
+            annotations = session.exec(annotations_stmt).all()
         
         # Filter annotations that have embeddings
         valid_annotations = [ann for ann in annotations if ann.embedding is not None]
@@ -377,71 +582,76 @@ def run_stage_2_analysis(
             
             # 4. LLM Cluster Labeling
             print("Generating thematic labels for clusters using LLM...")
-            cluster_mappings = {}
-            with OpenRouter(api_key=openrouter_api_key) as client:
-                for label in tqdm(valid_labels, desc="Labeling Clusters"):
-                    # Get all annotations currently assigned to this cluster (including resolved outliers)
-                    cluster_ann_indices = [i for i, ann in enumerate(valid_annotations) if ann.cluster_id == label]
-                    cluster_annotations = [valid_annotations[i] for i in cluster_ann_indices]
-                    
-                    # Calculate distances to centroid
-                    centroid = centroids[label]
-                    distances = []
-                    for ann_idx in cluster_ann_indices:
-                        vec = X_norm[ann_idx]
-                        dist = 1.0 - np.dot(vec, centroid) # cosine distance
-                        distances.append(dist)
-                        
-                    # Sort annotations by distance to centroid (ascending)
-                    sorted_ann_with_dist = sorted(zip(cluster_annotations, distances), key=lambda item: item[1])
-                    
-                    # Take top k representative items
-                    sample_size = min(label_sample_size, len(sorted_ann_with_dist))
-                    representative_items = sorted_ann_with_dist[:sample_size]
-                    
-                    # Format prompt
-                    sample_text = ""
-                    for item, dist in representative_items:
-                        sample_text += f"- Raw Tag: '{item.raw_tag}' | Summary: '{item.summary}'\n"
-                        
-                    prompt = (
-                        "You are an expert audience reception analyst studying how viewers discuss "
-                        "serialized television relationships.\n"
-                        "Below are representative raw tags and summaries from a semantically clustered "
-                        f"group of {len(cluster_annotations)} audience reactions:\n\n"
-                        f"{sample_text}\n"
-                        "Identify the unifying theme across these reactions and produce a single "
-                        "consolidated tag (2-5 words) that captures the shared topic or concern, "
-                        "including the specific reason for praise or criticism when it is clear. "
-                        "Prefer labels like 'earned emotional payoff', 'forced conflict writing', "
-                        "'natural romantic chemistry', or 'inconsistent character motivation' over "
-                        "generic labels like 'Character Analysis' or 'Relationship Dynamics'. "
-                        "Stay neutral and do not infer a reason that is not present in the examples.\n\n"
-                        "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
-                        '{"consolidated_tag": "<your label>"}'
+            label_items = []
+            for label in valid_labels:
+                # Get all annotations currently assigned to this cluster (including resolved outliers)
+                cluster_ann_indices = [i for i, ann in enumerate(valid_annotations) if ann.cluster_id == label]
+                cluster_annotations = [valid_annotations[i] for i in cluster_ann_indices]
+
+                # Calculate distances to centroid
+                centroid = centroids[label]
+                distances = []
+                for ann_idx in cluster_ann_indices:
+                    vec = X_norm[ann_idx]
+                    dist = 1.0 - np.dot(vec, centroid) # cosine distance
+                    distances.append(dist)
+
+                # Sort annotations by distance to centroid (ascending)
+                sorted_ann_with_dist = sorted(zip(cluster_annotations, distances), key=lambda item: item[1])
+
+                # Take top k representative items
+                sample_size = min(label_sample_size, len(sorted_ann_with_dist))
+                representative_items = sorted_ann_with_dist[:sample_size]
+
+                # Format prompt
+                sample_text = ""
+                for item, dist in representative_items:
+                    sample_text += f"- Raw Tag: '{item.raw_tag}' | Summary: '{item.summary}'\n"
+
+                prompt = (
+                    "You are an expert audience reception analyst studying how viewers discuss "
+                    "serialized television relationships.\n"
+                    "Below are representative raw tags and summaries from a semantically clustered "
+                    f"group of {len(cluster_annotations)} audience reactions:\n\n"
+                    f"{sample_text}\n"
+                    "Identify the unifying theme across these reactions and produce a single "
+                    "consolidated tag (2-5 words) that captures the shared topic or concern, "
+                    "including the specific reason for praise or criticism when it is clear. "
+                    "Prefer labels like 'earned emotional payoff', 'forced conflict writing', "
+                    "'natural romantic chemistry', or 'inconsistent character motivation' over "
+                    "generic labels like 'Character Analysis' or 'Relationship Dynamics'. "
+                    "Stay neutral and do not infer a reason that is not present in the examples. "
+                    "Never respond with a placeholder such as 'Cluster 1'.\n\n"
+                    "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
+                    '{"consolidated_tag": "<your label>"}'
+                )
+                label_items.append(
+                    Stage2LabelItem(
+                        cluster_id=int(label),
+                        prompt=prompt,
+                        fallback_label=fallback_cluster_label(cluster_annotations),
+                        item_count=len(cluster_annotations),
                     )
-                    
-                    try:
-                        response = client.chat.send(
-                            model=labeling_model,
-                            messages=[
-                                {"role": "user", "content": prompt}
-                            ],
-                            temperature=0.1
-                        )
-                        content = response.choices[0].message.content
-                        parsed_data = parse_json_content(content)
-                        output = ClusterLabelOutput.model_validate(parsed_data)
-                        consolidated_tag = output.consolidated_tag.strip()
-                        cluster_mappings[label] = consolidated_tag
-                        print(f"  Cluster {label} labeled: '{consolidated_tag}' (based on {len(cluster_annotations)} items)")
-                    except Exception as e:
-                        print(f"  Failed to label cluster {label}: {e}")
-                        cluster_mappings[label] = f"Cluster {label}"
+                )
+
+            label_results = asyncio.run(
+                run_stage_2_label_batch(
+                    label_items,
+                    openrouter_api_key,
+                    labeling_model,
+                    concurrency,
+                )
+            )
+            cluster_mappings = {}
+            for result in label_results:
+                cluster_mappings[result.cluster_id] = result.label
+                if result.error:
+                    print(f"  Failed to label cluster {result.cluster_id}: {result.error}")
+                print(f"  Cluster {result.cluster_id} labeled: '{result.label}' (based on {result.item_count} items)")
                         
             # Apply consolidated tags in the DB
             for ann in valid_annotations:
-                ann.consolidated_tag = cluster_mappings.get(ann.cluster_id, f"Cluster {ann.cluster_id}")
+                ann.consolidated_tag = cluster_mappings.get(ann.cluster_id, fallback_cluster_label([ann]))
                 upsert_annotation(session, ann)
                 
         else:
