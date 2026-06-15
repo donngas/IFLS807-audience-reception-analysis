@@ -32,6 +32,8 @@ class Annotation(SQLModel, table=True):
     sentiment: float
     summary: str
     raw_tag: str
+    is_substantive: bool = Field(default=True)
+    reception_reason: Optional[str] = Field(default=None, nullable=True)
     consolidated_tag: Optional[str] = Field(default=None, nullable=True)
     cluster_explanation: Optional[str] = Field(default=None, nullable=True)
     cluster_id: Optional[int] = Field(default=None, nullable=True)
@@ -57,6 +59,12 @@ def ensure_annotation_schema():
     with engine.begin() as conn:
         if "cluster_explanation" not in columns:
             conn.execute(text("ALTER TABLE annotation ADD COLUMN cluster_explanation VARCHAR"))
+        if "is_substantive" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN is_substantive BOOLEAN NOT NULL DEFAULT 1"))
+            conn.execute(text("UPDATE annotation SET is_substantive = 0 WHERE LOWER(raw_tag) = 'reaction only'"))
+        if "reception_reason" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN reception_reason VARCHAR"))
+            conn.execute(text("UPDATE annotation SET reception_reason = raw_tag WHERE is_substantive = 1"))
 
 def get_session():
     with Session(engine) as session:
