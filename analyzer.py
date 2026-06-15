@@ -33,6 +33,13 @@ class Stage1Output(BaseModel):
     raw_tag: str = Field(
         description="A primary 2-5 word descriptor theme that captures the reason for the reaction when available. Use 'Reaction Only' if no specific analytical theme."
     )
+    is_substantive: bool = Field(
+        description="Whether the text gives a specific reason for the audience reaction, not merely emotion or enthusiasm."
+    )
+    reception_reason: Optional[str] = Field(
+        default=None,
+        description="A concise 2-6 word reason explaining why the audience reacts this way, or null for non-substantive reactions."
+    )
 
 # Stage 2 Schema (Cluster Labeling from LLM)
 class ClusterLabelOutput(BaseModel):
@@ -47,23 +54,33 @@ class ClusterLabelOutput(BaseModel):
 STAGE_1_SYSTEM_PROMPT = (
     "You are an expert audience reception analyst specializing in how viewers discuss "
     "serialized television relationships on Reddit. Analyze the given text and extract "
-    "its sentiment, a concise summary, and a primary thematic tag.\n\n"
+    "sentiment, a concise summary, whether the text is analytically substantive, "
+    "and the specific reception reason when one exists.\n\n"
     "SENTIMENT — You MUST choose exactly one of these five values:\n"
     "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
     "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
     "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
     "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
     "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
-    "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point.\n\n"
-    "RAW TAG — Assign a neutral 2-5 word thematic descriptor that captures the specific "
-    "reason behind the reaction when the text provides one. Prefer tags like "
+    "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point. "
+    "If the text only expresses affect, say that it expresses a reaction without a specific reason.\n\n"
+    "SUBSTANCE CHECK — Set is_substantive to true ONLY if the text states or strongly implies "
+    "a specific why/how reason for liking, disliking, defending, criticizing, or interpreting the couple. "
+    "If the text merely expresses intensity, affection, dislike, excitement, sadness, shipping, "
+    "parasocial attachment, or a meme-like reaction without a concrete reason, set is_substantive=false.\n\n"
+    "RECEPTION REASON / RAW TAG — If is_substantive=true, provide a neutral 2-6 word "
+    "reception_reason and matching raw_tag that capture the specific reason behind the reaction. "
+    "Prefer tags like "
     "'earned emotional payoff', 'forced conflict writing', 'supportive partner dynamic', "
     "'inconsistent character motivation', or 'chemistry through banter' over generic tags "
     "like 'character behavior', 'character analysis', or 'relationship opinion'. "
-    "Do not invent reasons that are not stated or strongly implied. If the text is too short "
-    "(<15 chars), deleted, or lacks analytical substance, use 'Reaction Only'.\n\n"
+    "Do not invent reasons that are not stated or strongly implied.\n\n"
+    "If is_substantive=false, set reception_reason=null and raw_tag='Reaction Only'. "
+    "Do not turn mere intensity, attachment, or enthusiasm into a substantive tag unless "
+    "the text gives a concrete cause for that reaction.\n\n"
     "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
-    '{"sentiment": <float>, "summary": "<string>", "raw_tag": "<string>"}'
+    '{"sentiment": <float>, "summary": "<string>", "is_substantive": <bool>, '
+    '"reception_reason": <string|null>, "raw_tag": "<string>"}'
 )
 
 SENTIMENT_VALUES = [-1.0, -0.5, 0.0, 0.5, 1.0]
@@ -136,7 +153,27 @@ def normalize_stage_1_output(parsed_data: dict) -> Stage1Output:
     except (ValueError, TypeError):
         raw_sentiment = 0.0
     parsed_data["sentiment"] = min(SENTIMENT_VALUES, key=lambda x: abs(x - raw_sentiment))
+    if "is_substantive" not in parsed_data:
+        parsed_data["is_substantive"] = str(parsed_data.get("raw_tag", "")).strip().lower() != "reaction only"
+    if "reception_reason" not in parsed_data:
+        parsed_data["reception_reason"] = parsed_data.get("raw_tag") if parsed_data["is_substantive"] else None
     return Stage1Output.model_validate(parsed_data)
+
+
+def normalize_substance_fields(output: Stage1Output) -> Stage1Output:
+    reason = clean_label_text(output.reception_reason)
+    raw_tag = clean_label_text(output.raw_tag)
+    is_substantive = bool(output.is_substantive)
+
+    if not is_substantive or not reason or raw_tag.lower() == "reaction only":
+        output.is_substantive = False
+        output.reception_reason = None
+        output.raw_tag = "Reaction Only"
+        return output
+
+    output.reception_reason = reason
+    output.raw_tag = raw_tag or reason
+    return output
 
 
 def clean_label_text(label: Optional[str]) -> str:
@@ -163,7 +200,11 @@ def is_generic_cluster_label(label: str) -> bool:
 
 
 def fallback_cluster_label(annotations: List[Annotation]) -> str:
-    tags = [clean_label_text(ann.raw_tag) for ann in annotations if clean_label_text(ann.raw_tag)]
+    tags = [
+        clean_label_text(ann.reception_reason or ann.raw_tag)
+        for ann in annotations
+        if clean_label_text(ann.reception_reason or ann.raw_tag)
+    ]
     tags = [tag for tag in tags if tag.lower() != "reaction only"]
     if not tags:
         return "Reaction Only"
@@ -230,13 +271,15 @@ def analyze_stage_1_item(
 
         response = run_openrouter_with_retries(request, f"Stage 1 {item.item_type} {item.item_id}")
         content = response.choices[0].message.content
-        output = normalize_stage_1_output(parse_json_content(content))
+        output = normalize_substance_fields(normalize_stage_1_output(parse_json_content(content)))
         annotation = Annotation(
             item_id=item.item_id,
             item_type=item.item_type,
             sentiment=output.sentiment,
             summary=output.summary,
-            raw_tag=output.raw_tag
+            raw_tag=output.raw_tag,
+            is_substantive=output.is_substantive,
+            reception_reason=output.reception_reason,
         )
         return Stage1Result(item_id=item.item_id, item_type=item.item_type, annotation=annotation)
     except Exception as e:
@@ -485,14 +528,29 @@ def run_stage_2_analysis(
             return
             
         print(f"Stage 2: Found {len(annotations)} annotations in the database.")
+        substantive_annotations = [ann for ann in annotations if ann.is_substantive]
+        reaction_only_count = len(annotations) - len(substantive_annotations)
+        if reaction_only_count:
+            print(f"Stage 2: Excluding {reaction_only_count} non-substantive Reaction Only annotations from clustering.")
+
+        for ann in annotations:
+            if not ann.is_substantive:
+                ann.cluster_id = None
+                ann.consolidated_tag = None
+                ann.cluster_explanation = None
+                upsert_annotation(session, ann)
+
+        if not substantive_annotations:
+            print("No substantive annotations found. Stage 2 clustering skipped.")
+            return
         
         # 1. Generate Embeddings (checking cache)
         embeddings_needed = [
             Stage2EmbeddingItem(
                 item_id=ann.item_id,
-                text=f"Tag: {ann.raw_tag} | Summary: {ann.summary}",
+                text=f"Reception Reason: {ann.reception_reason or ann.raw_tag} | Raw Tag: {ann.raw_tag} | Summary: {ann.summary}",
             )
-            for ann in annotations
+            for ann in substantive_annotations
             if force_reembed or not ann.embedding
         ]
 
@@ -521,9 +579,10 @@ def run_stage_2_analysis(
 
             # Reload annotations to ensure we have all embeddings
             annotations = session.exec(annotations_stmt).all()
+            substantive_annotations = [ann for ann in annotations if ann.is_substantive]
         
         # Filter annotations that have embeddings
-        valid_annotations = [ann for ann in annotations if ann.embedding is not None]
+        valid_annotations = [ann for ann in substantive_annotations if ann.embedding is not None]
         if not valid_annotations:
             print("No valid embeddings found. Cannot proceed with clustering.")
             return
@@ -556,11 +615,12 @@ def run_stage_2_analysis(
         
         if n_samples < 2:
             print("Too few annotations to run clustering (need at least 2).")
-            # Assign them all to cluster 0 and label them manually/Reaction Only
+            # Assign a local fallback label without calling the cluster labeler.
             for ann in valid_annotations:
+                fallback_label = fallback_cluster_label([ann])
                 ann.cluster_id = 0
-                ann.consolidated_tag = "Reaction Only"
-                ann.cluster_explanation = "Too few annotations were available for clustering, so this item was assigned to Reaction Only."
+                ann.consolidated_tag = fallback_label
+                ann.cluster_explanation = fallback_cluster_explanation(fallback_label, [ann])
                 upsert_annotation(session, ann)
             return
 
@@ -634,17 +694,20 @@ def run_stage_2_analysis(
                 # Format prompt
                 sample_text = ""
                 for item, dist in representative_items:
-                    sample_text += f"- Raw Tag: '{item.raw_tag}' | Summary: '{item.summary}'\n"
+                    sample_text += (
+                        f"- Reception Reason: '{item.reception_reason or item.raw_tag}' | "
+                        f"Raw Tag: '{item.raw_tag}' | Summary: '{item.summary}'\n"
+                    )
 
                 prompt = (
                     "You are an expert audience reception analyst studying how viewers discuss "
                     "serialized television relationships.\n"
-                    "Below are representative raw tags and summaries from a semantically clustered "
+                    "Below are representative reception reasons, raw tags, and summaries from a semantically clustered "
                     f"group of {len(cluster_annotations)} audience reactions:\n\n"
                     f"{sample_text}\n"
                     "Identify the unifying theme across these reactions and produce a single "
-                    "consolidated tag (2-5 words) that captures the shared topic or concern, "
-                    "including the specific reason for praise or criticism when it is clear. "
+                    "consolidated tag (2-5 words) that captures the shared reception reason, "
+                    "not merely the fact that commenters are emotionally engaged. "
                     "Prefer labels like 'earned emotional payoff', 'forced conflict writing', "
                     "'natural romantic chemistry', or 'inconsistent character motivation' over "
                     "generic labels like 'Character Analysis' or 'Relationship Dynamics'. "
@@ -691,10 +754,14 @@ def run_stage_2_analysis(
                 upsert_annotation(session, ann)
                 
         else:
-            print("HDBSCAN found 0 clusters. All items classified as noise. Assigning 'Reaction Only'.")
+            print("HDBSCAN found 0 clusters. All substantive items classified as noise. Assigning fallback labels.")
             for ann in valid_annotations:
-                ann.consolidated_tag = "Reaction Only"
-                ann.cluster_explanation = "HDBSCAN found no stable clusters, so all items were assigned to Reaction Only."
+                fallback_label = fallback_cluster_label([ann])
+                ann.consolidated_tag = fallback_label
+                ann.cluster_explanation = (
+                    "HDBSCAN found no stable clusters, so this item keeps its strongest available "
+                    f"reception reason: {fallback_label}."
+                )
                 upsert_annotation(session, ann)
                 
     print("Stage 2 clustering and labeling completed.")
