@@ -7,6 +7,10 @@ import numpy as np
 from sklearn.cluster import HDBSCAN
 from openrouter import OpenRouter
 from sqlmodel import select
+from dotenv import load_dotenv
+
+# Load environment variables at module import time
+load_dotenv()
 
 from database import (
     Session, engine, get_pending_posts, get_pending_comments,
@@ -16,8 +20,8 @@ from database import (
 
 # Stage 1 Schema
 class Stage1Output(BaseModel):
-    sentiment: Literal[-1.0, -0.5, 0.0, 0.5, 1.0] = Field(
-        description="Sentiment polarity score: strongly negative (-1.0) to strongly positive (1.0)"
+    sentiment: float = Field(
+        description="Sentiment polarity score: strongly negative (-1.0) to strongly positive (1.0). Choose from: -1.0, -0.5, 0.0, 0.5, 1.0"
     )
     summary: str = Field(
         description="A concise 1-2 sentence summary of the post or comment."
@@ -32,6 +36,18 @@ class ClusterLabelOutput(BaseModel):
         description="A concise 1-3 word descriptor category for this cluster of reactions (e.g., 'Character Chemistry', 'Dialogue Quality', etc.)."
     )
 
+def parse_json_content(content: str) -> dict:
+    """Helper to clean up markdown codeblocks if any, and parse content as JSON."""
+    clean_content = content.strip()
+    if clean_content.startswith("```"):
+        lines = clean_content.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean_content = "\n".join(lines).strip()
+    return json.loads(clean_content)
+
 def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, temperature: float = 0.1, force_reanalyze: bool = False):
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_api_key:
@@ -41,10 +57,21 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
         model_name = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it")
     
     system_prompt = (
-        "You are an expert audience reception analyst. Analyze the following Reddit text and extract "
-        "the sentiment, summary, and a primary raw tag. "
-        "Guideline: If the text is shorter than 15 characters or lacks analytical substance, "
-        "classify it with the tag 'Reaction Only'."
+        "You are an expert audience reception analyst specializing in how viewers discuss "
+        "serialized television relationships on Reddit. Analyze the given text and extract "
+        "its sentiment, a concise summary, and a primary thematic tag.\n\n"
+        "SENTIMENT — You MUST choose exactly one of these five values:\n"
+        "  -1.0 = Strongly Negative (harsh criticism, frustration, anger)\n"
+        "  -0.5 = Mildly Negative (disappointment, mild criticism, concern)\n"
+        "   0.0 = Neutral or Mixed (balanced take, factual observation, ambivalent)\n"
+        "   0.5 = Mildly Positive (enjoyment, casual praise, mild enthusiasm)\n"
+        "   1.0 = Strongly Positive (passionate praise, strong emotional approval)\n\n"
+        "SUMMARY — Write a concise 1-2 sentence summary capturing the author's core point.\n\n"
+        "RAW TAG — Assign a 1-3 word thematic descriptor reflecting the dominant topic "
+        "(e.g. 'character chemistry', 'plot pacing', 'dialogue quality', 'emotional payoff'). "
+        "If the text is too short (<15 chars), deleted, or lacks analytical substance, use 'Reaction Only'.\n\n"
+        "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
+        '{"sentiment": <float>, "summary": "<string>", "raw_tag": "<string>"}'
     )
     
     with OpenRouter(api_key=openrouter_api_key) as client:
@@ -66,17 +93,21 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": text_to_analyze}
                         ],
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "Stage1Output",
-                                "strict": True,
-                                "schema": Stage1Output.model_json_schema()
-                            }
-                        },
                         temperature=temperature
                     )
-                    output = Stage1Output.model_validate_json(response.choices[0].message.content)
+                    content = response.choices[0].message.content
+                    parsed_data = parse_json_content(content)
+                    
+                    # Fallback: snap to nearest discrete value if LLM returns an off-scale score
+                    try:
+                        raw_sentiment = float(parsed_data.get("sentiment", 0.0))
+                    except (ValueError, TypeError):
+                        raw_sentiment = 0.0
+                    parsed_data["sentiment"] = min(
+                        [-1.0, -0.5, 0.0, 0.5, 1.0], key=lambda x: abs(x - raw_sentiment)
+                    )
+                    
+                    output = Stage1Output.model_validate(parsed_data)
                     annotation = Annotation(
                         item_id=post.id,
                         item_type="post",
@@ -107,17 +138,20 @@ def run_stage_1_analysis(model_name: Optional[str] = None, limit: int = 100, tem
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": comment.body}
                         ],
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "Stage1Output",
-                                "strict": True,
-                                "schema": Stage1Output.model_json_schema()
-                            }
-                        },
                         temperature=temperature
                     )
-                    output = Stage1Output.model_validate_json(response.choices[0].message.content)
+                    content = response.choices[0].message.content
+                    parsed_data = parse_json_content(content)
+                    
+                    # Safely map sentiment to nearest discrete allowed value
+                    try:
+                        raw_sentiment = float(parsed_data.get("sentiment", 0.0))
+                    except (ValueError, TypeError):
+                        raw_sentiment = 0.0
+                    mapped_sentiment = min([-1.0, -0.5, 0.0, 0.5, 1.0], key=lambda x: abs(x - raw_sentiment))
+                    parsed_data["sentiment"] = mapped_sentiment
+                    
+                    output = Stage1Output.model_validate(parsed_data)
                     annotation = Annotation(
                         item_id=comment.id,
                         item_type="comment",
@@ -297,15 +331,17 @@ def run_stage_2_analysis(
                         sample_text += f"- Raw Tag: '{item.raw_tag}' | Summary: '{item.summary}'\n"
                         
                     prompt = (
-                        "You are an expert audience reception analyst studying serialized romance in television.\n"
-                        "Below is a list of representative raw tags and summaries from a cluster of audience reactions:\n\n"
+                        "You are an expert audience reception analyst studying how viewers discuss "
+                        "serialized television relationships.\n"
+                        "Below are representative raw tags and summaries from a semantically clustered "
+                        f"group of {len(cluster_annotations)} audience reactions:\n\n"
                         f"{sample_text}\n"
-                        "Please group these reactions under a single cohesive, consolidated tag. "
-                        "The consolidated tag should be 1 to 3 words in length (e.g., 'Character Chemistry', 'Dialogue Quality', 'Pacing Issues').\n"
-                        "Return a JSON object matching this schema:\n"
-                        "{\n"
-                        "  \"consolidated_tag\": \"your label\"\n"
-                        "}"
+                        "Identify the unifying theme across these reactions and produce a single "
+                        "consolidated tag (1-3 words) that captures the shared topic or concern. "
+                        "Good examples: 'Character Chemistry', 'Emotional Payoff', 'Writing Quality', "
+                        "'Relationship Dynamics', 'Pacing Issues'.\n\n"
+                        "Respond ONLY with a raw JSON object — no markdown, no explanation:\n"
+                        '{"consolidated_tag": "<your label>"}'
                     )
                     
                     try:
@@ -314,17 +350,11 @@ def run_stage_2_analysis(
                             messages=[
                                 {"role": "user", "content": prompt}
                             ],
-                            response_format={
-                                "type": "json_schema",
-                                "json_schema": {
-                                    "name": "ClusterLabelOutput",
-                                    "strict": True,
-                                    "schema": ClusterLabelOutput.model_json_schema()
-                                }
-                            },
                             temperature=0.1
                         )
-                        output = ClusterLabelOutput.model_validate_json(response.choices[0].message.content)
+                        content = response.choices[0].message.content
+                        parsed_data = parse_json_content(content)
+                        output = ClusterLabelOutput.model_validate(parsed_data)
                         consolidated_tag = output.consolidated_tag.strip()
                         cluster_mappings[label] = consolidated_tag
                         print(f"  Cluster {label} labeled: '{consolidated_tag}' (based on {len(cluster_annotations)} items)")

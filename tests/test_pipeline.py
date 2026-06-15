@@ -232,7 +232,12 @@ def test_visualizations(mock_handle_output):
     assert mock_handle_output.call_count == 8
 
 @patch("scraper.fetch_json")
-def test_scrape_reddit_json_mock(mock_fetch_json):
+@patch("scraper.PlaywrightManager")
+@patch("scraper.fetch_json_playwright")
+def test_scrape_reddit_json_mock(mock_fetch_json_playwright, mock_playwright_manager, mock_fetch_json):
+    # Mock Playwright to fail
+    mock_fetch_json_playwright.side_effect = Exception("Playwright failed")
+    
     # Mock the return values for search and comments matching PullPush structure
     mock_search_res = {
         "data": [
@@ -247,7 +252,7 @@ def test_scrape_reddit_json_mock(mock_fetch_json):
             }
         ]
     }
-    
+
     mock_comments_res = {
         "data": [
             {
@@ -259,30 +264,35 @@ def test_scrape_reddit_json_mock(mock_fetch_json):
             }
         ]
     }
-    
-    # Simulate direct Reddit JSON scrape failing (e.g. 403) and falling back to PullPush
+
+    # Simulate:
+    # 1. Direct search fails -> Playwright search fails -> PullPush search succeeds
+    # 2. Direct comment fails -> Playwright comment fails -> PullPush comment succeeds
     mock_fetch_json.side_effect = [
         Exception("Direct search 403 Forbidden"),
         mock_search_res,
+        Exception("Direct comments 403 Forbidden"),
         mock_comments_res
     ]
-    
+
     from scraper import scrape_reddit
     with patch("time.sleep"):
         scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="json")
-        
+
     with Session(test_engine) as session:
         post = session.get(Post, "post_json1")
         assert post is not None
         assert post.title == "Test Post JSON"
-        
+
         comment = session.get(Comment, "comment_json1")
         assert comment is not None
         assert comment.body == "Test Comment JSON"
 
 
 @patch("scraper.fetch_json")
-def test_scrape_reddit_json_direct_success_mock(mock_fetch_json):
+@patch("scraper.PlaywrightManager")
+@patch("scraper.fetch_json_playwright")
+def test_scrape_reddit_json_direct_success_mock(mock_fetch_json_playwright, mock_playwright_manager, mock_fetch_json):
     # Mock the return values for search and comments matching Reddit's structure
     mock_search_res = {
         "data": {
@@ -336,5 +346,126 @@ def test_scrape_reddit_json_direct_success_mock(mock_fetch_json):
         comment = session.get(Comment, "direct_comment1")
         assert comment is not None
         assert comment.body == "Direct Comment Body"
+
+
+@patch("scraper.fetch_json")
+@patch("scraper.PlaywrightManager")
+@patch("scraper.fetch_json_playwright")
+def test_scrape_reddit_json_playwright_success_mock(mock_fetch_json_playwright, mock_playwright_manager, mock_fetch_json):
+    # Mock direct search/comments to fail
+    mock_fetch_json.side_effect = Exception("Direct fetch 403 Forbidden")
+    
+    # Mock Playwright search and comments to succeed
+    mock_search_res = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "pw_post1",
+                        "subreddit": "testsub",
+                        "title": "Playwright Post Title",
+                        "selftext": "Playwright Post Body",
+                        "score": 20,
+                        "created_utc": 3000000.0,
+                        "author": "PWUser"
+                    }
+                }
+            ]
+        }
+    }
+    
+    mock_comments_res = [
+        {}, # first element (post details)
+        {   # second element (comments list)
+            "data": {
+                "children": [
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "id": "pw_comment1",
+                            "body": "Playwright Comment Body",
+                            "score": 12,
+                            "created_utc": 3000010.0,
+                            "author": "PWUser2"
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+    
+    mock_fetch_json_playwright.side_effect = [mock_search_res, mock_comments_res]
+    
+    from scraper import scrape_reddit
+    with patch("time.sleep"):
+        scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="json")
+        
+    with Session(test_engine) as session:
+        post = session.get(Post, "pw_post1")
+        assert post is not None
+        assert post.title == "Playwright Post Title"
+        
+        comment = session.get(Comment, "pw_comment1")
+        assert comment is not None
+        assert comment.body == "Playwright Comment Body"
+
+
+@patch("scraper.fetch_json")
+@patch("scraper.PlaywrightManager")
+@patch("scraper.fetch_json_playwright")
+def test_scrape_reddit_playwright_direct_mock(mock_fetch_json_playwright, mock_playwright_manager, mock_fetch_json):
+    # Mock Playwright search and comments to succeed
+    mock_search_res = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "pw_direct_post1",
+                        "subreddit": "testsub",
+                        "title": "Playwright Direct Title",
+                        "selftext": "Playwright Direct Body",
+                        "score": 30,
+                        "created_utc": 4000000.0,
+                        "author": "PWDirectUser"
+                    }
+                }
+            ]
+        }
+    }
+    
+    mock_comments_res = [
+        {},
+        {
+            "data": {
+                "children": [
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "id": "pw_direct_comment1",
+                            "body": "Playwright Direct Comment",
+                            "score": 15,
+                            "created_utc": 4000010.0,
+                            "author": "PWDirectUser2"
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+    
+    mock_fetch_json_playwright.side_effect = [mock_search_res, mock_comments_res]
+    
+    from scraper import scrape_reddit
+    with patch("time.sleep"):
+        scrape_reddit("query", subreddits=["testsub"], post_limit=1, comment_limit=1, method="playwright")
+        
+    with Session(test_engine) as session:
+        post = session.get(Post, "pw_direct_post1")
+        assert post is not None
+        assert post.title == "Playwright Direct Title"
+        
+        comment = session.get(Comment, "pw_direct_comment1")
+        assert comment is not None
+        assert comment.body == "Playwright Direct Comment"
 
 

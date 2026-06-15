@@ -1,6 +1,10 @@
 import os
 from typing import Optional, List
 from sqlmodel import Field, SQLModel, Session, create_engine, select, func
+from dotenv import load_dotenv
+
+# Load environment variables at module import time
+load_dotenv()
 
 # Database Schema
 

@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--sort", type=str, default="top", help="Reddit search sort")
     parser.add_argument("--time-filter", type=str, default="all", help="Reddit search time filter")
     parser.add_argument("--force-overwrite", action="store_true", help="Force overwrite existing scraped items")
-    parser.add_argument("--method", choices=["praw", "json"], default="praw", help="Data acquisition method (praw or json)")
+    parser.add_argument("--method", choices=["praw", "json", "playwright"], default="praw", help="Data acquisition method (praw, json, or playwright)")
     
     # Stage 1 args
     parser.add_argument("--model", type=str, help="OpenRouter model name")
@@ -245,11 +245,12 @@ def run_interactive_wizard():
                 "Select data acquisition method:",
                 choices=[
                     "1. PRAW (Reddit API - requires credentials)",
-                    "2. Unauthenticated JSON (Bypass API keys)"
+                    "2. Unauthenticated JSON (Bypass API keys)",
+                    "3. Playwright (Direct headless browser scraping)"
                 ],
                 default="1. PRAW (Reddit API - requires credentials)"
             ).ask()
-            method_val = "praw" if "PRAW" in method_choice else "json"
+            method_val = "praw" if "PRAW" in method_choice else ("playwright" if "Playwright" in method_choice else "json")
             
             # Advanced Scraping Options
             sort_val = "top"
