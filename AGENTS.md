@@ -1,2 +1,3 @@
-- use uv for dependency management and all execution including but not limited to tests
-- at this stage, assume ollama is not configured. code and test without it
+- use uv for dependency management and all execution including but not limited to tests.
+- have default tests passable without the credentials configured.
+- granular commit, following conventional commit rules.
