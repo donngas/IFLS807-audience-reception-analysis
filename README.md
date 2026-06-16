@@ -148,6 +148,11 @@ Every plot supports either interactive preview windows or high-resolution PNG ex
 ### 5. Utilities (`util.py`)
 
 - Facilitates data importing and exporting to CSV/JSON to aid final essay writing and graph plotting.
+- `export_theme_pareto_data.py` exports chart-ready theme dominance Pareto data from any selected workspace DB:
+  - CSV: `uv run python export_theme_pareto_data.py --db jake_amy.db --format csv`
+  - XLSX: `uv run python export_theme_pareto_data.py --db jake_amy.db --format xlsx`
+  - Output columns include `theme`, `items_in_theme`, and `cumulative_share_percent`, which can be used in Word/Excel to recreate the Pareto chart at report-friendly dimensions.
+- `export_theme_dominance_summary.py` exports a report-ready table of `consolidated_tag`, one-decimal dominance percentage, and consolidated tag explanation in decreasing dominance order.
 
 ---
 
