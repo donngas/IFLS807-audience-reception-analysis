@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.env.example
 
 # Python
 __pycache__/
@@ -17,8 +18,19 @@ ENV/
 *.json
 *.jsonl
 *.csv
+*.xlsx
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
+
+# Visualizations
+plots/
+exports/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
 
 

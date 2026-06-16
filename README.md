@@ -20,28 +20,28 @@ A --> C[scraper.py]
 A --> D[analyzer.py]
 
 C -->|PRAW Scrape| B[(SQLite DB)]
-D -->|Ollama / Gemma| B
+D -->|OpenRouter LLM & Embeddings| B
 
 subgraph Modules
 C[scraper.py: Reddit Acquisition]
-D[analyzer.py: LLM Inference & Consolidation]
+D[analyzer.py: Feature Extraction & Semantic Clustering]
 B[database.py: SQLModel DB Schemas & CRUD]
 end
 ```
 
 ### Module Descriptions
 
-- **`main.py`**: The central entrypoint. Supports command-line parameters (for automated scripting) and an interactive CLI wizard using `questionary` when run with no arguments.
-- **`database.py`**: Defines the SQLModel database schemas and handles SQLite session connection and CRUD helper transactions (such as safe upserts). Creates the SQLite file locally at `./audience_reception.db`.
-- **`scraper.py`**: Uses PRAW (Python Reddit API Wrapper) to fetch search results matching boolean query logic (e.g., `(Jake AND Amy)`) and scrape corresponding top-level comments.
-- **`analyzer.py`**: Manages LLM prompting, system messages, and JSON structured output requests using the native `ollama` Python library with Pydantic schemas.
-- **`util.py`**: Provides import/export capabilities (CSV/JSON) to export processed data for external statistical or qualitative tools.
+- **`main.py`**: The central entrypoint. Supports command-line parameters and an interactive CLI wizard. Features **Workspace Selection** (to sandbox different couples into separate `.db` databases) and a **Search Query Builder** helper.
+- **`database.py`**: Defines SQLModel schemas and database helpers. The SQLite filename is dynamically loaded from the environment variable `WORKSPACE_DB` (defaulting to `audience_reception.db`) to keep workspaces separated.
+- **`scraper.py`**: Uses PRAW or unauthenticated JSON endpoints to fetch search results matching boolean query logic (e.g., `(Jake AND Amy)`) and scrape comments.
+- **`analyzer.py`**: Manages Stage 1 LLM inference (sentiment, summaries, raw tags) and Stage 2 HDBSCAN semantic clustering.
+- **`util.py`**: Provides CSV/JSON import/export utilities.
 
 ---
 
 ## Database Schema & State Tracking
 
-We use SQLite via SQLModel. The schema consists of three tables, eliminating join tables by assigning **exactly one primary tag** per item.
+We use SQLite via SQLModel. The schema consists of three tables, decoupling Reddit metadata from NLP analysis annotations and clustering states.
 
 ```mermaid
 erDiagram
@@ -53,9 +53,6 @@ erDiagram
         int score
         float created_utc
         string status "pending | processed | failed | skipped"
-        float sentiment "nullable"
-        string summary "nullable"
-        string raw_tag "nullable"
     }
     Comment {
         string id PK "Reddit Comment ID"
@@ -64,18 +61,24 @@ erDiagram
         int score
         float created_utc
         string status "pending | processed | failed | skipped"
-        float sentiment "nullable"
-        string summary "nullable"
-        string raw_tag "nullable"
     }
-    TagMapping {
-        string raw_tag PK "Primary Key"
+    Annotation {
+        string item_id PK "Reddit Post or Comment ID"
+        string item_type "post | comment"
+        float sentiment
+        string summary
+        string raw_tag
+        bool is_substantive
+        string reception_reason "nullable"
         string consolidated_tag "nullable"
+        string cluster_explanation "nullable"
+        int cluster_id "nullable"
+        string embedding "nullable"
     }
 
     Post ||--o{ Comment : "has"
-    Post }o--o| TagMapping : "has raw_tag"
-    Comment }o--o| TagMapping : "has raw_tag"
+    Post ||--o| Annotation : "has annotation"
+    Comment ||--o| Annotation : "has annotation"
 ```
 
 ### Universal State System
@@ -83,7 +86,7 @@ erDiagram
 Both `Post` and `Comment` use a `status` field to manage pipeline progress and ensure idempotency:
 
 - **`pending`**: Scraped and stored, awaiting Stage 1 LLM inference.
-- **`processed`**: Stage 1 inference completed successfully, and sentiment, summary, and raw_tag are populated.
+- **`processed`**: Stage 1 inference completed successfully, and sentiment, summary, substance classification, and tags are populated.
 - **`failed`**: The LLM returned unparseable output or timed out repeatedly. Kept in the DB to avoid infinite retries.
 - **`skipped`**: Marked for exclusion (e.g. if the post has no body text, if a comment is too brief, or if it is filtered out as low-substance noise).
 
@@ -93,44 +96,76 @@ Both `Post` and `Comment` use a `status` field to manage pipeline progress and e
 
 ### 1. Reddit Acquisition (`scraper.py`)
 
-- Queries designated subreddits using Reddit's native search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
+- **Acquisition Methods**: Exposes a modular, plug-and-play design supporting two methods:
+  - **PRAW (Reddit API)**: Uses official credentials (`REDDIT_CLIENT_ID`, etc.) and PRAW wrapper functions.
+  - **Unauthenticated JSON (API Bypass)**: Direct HTTP requests to Reddit's public `.json` endpoints (e.g., `search.json` and `comments.json`). Automatically respects rate limits by sleeping 1 second between requests.
+- Queries designated subreddits using Reddit's search API. One or more subreddits can be specified via the interactive CLI wizard or script parameters (e.g. `r/television, r/relationship_advice`). If none is specified, it defaults to `r/all`.
 - **Query Translation**: Since custom queries might be entered using curly braces (e.g. `{Jake AND Amy}`), the scraper automatically normalizes these to standard parenthetical expressions (e.g. `(Jake AND Amy)`) before sending them to PRAW.
-- **Ordering**: Results are sorted by `top` with a time filter of `all` to capture the most representative discussions.
-- **Scrape Volume**: Scrapes approximately 100 posts per query and up to 100 top-level comments per post.
+- **Ordering**: Results are sorted by configurable parameters (such as `top`, `hot`, `new`, `relevance`) with a time filter (such as `all`, `year`, `month`, `week`, `day`).
+- **Scrape Volume**: Scrapes 50 usable posts per query by default and up to 25 top-level comments per post. By default, acquisition keeps fetching additional search results until the saved usable posts reach the requested post limit, when enough results are available. Use `--no-fill-post-limit` to treat the post limit as the number of search candidates to try instead.
 - **Filtering Noise**: Automatically ignores or marks as `skipped` on scraping:
   - Comments where the body is `"[deleted]"` or `"[removed]"`
   - Comments authored by `"AutoModerator"` (or other common bots)
   - Empty items or items containing only image links.
 - Persists data directly to SQLite, checking for existing IDs to avoid duplicate API calls.
+- **Multi-job Runner**: In the interactive wizard, the first three pipeline steps can be selected together. The wizard gathers each selected job's configuration up front using the same prompts as the individual menu items, then runs acquisition, Stage 1, and Stage 2 automatically in order.
 
 ### 2. Stage 1: Feature Extraction (`analyzer.py`)
 
-- Performs LLM inference on individual posts and top-level comments marked as `pending`.
-- Queries Gemma 4 E4B via Ollama to retrieve structured JSON. Enforces JSON schemas by passing a Pydantic model (`class Stage1Output(BaseModel)`) directly to Ollama's `format` option.
+- Performs concurrent LLM inference on all posts and top-level comments marked as `pending`, with 10 concurrent OpenRouter requests by default and retry/backoff handling for transient rate-limit-like errors.
+- Queries OpenRouter models (e.g. `google/gemma-4-26b-a4b-it`) to retrieve structured JSON. Enforces JSON schemas using Pydantic models.
 - Structured JSON fields:
   - **sentiment**: A discrete numeric score representing sentiment polarity, restricted to exactly: `[-1.0, -0.5, 0.0, 0.5, 1.0]` (Strongly Negative, Negative, Neutral/Mixed, Positive, Strongly Positive).
   - **summary**: A concise 1-2 sentence summarization.
-  - **raw_tag**: A single primary descriptive tag (1-3 words in length, e.g., `"chemistry"`, `"pacing issues"`, `"rushed writing"`). If the content has no meaningful theme (e.g., simple memes, expressions, or low-substance content), the model returns `"Reaction Only"`.
-- **Substance Check Guideline**: The LLM prompt contains a gentle guideline suggesting that if a post/comment contains less than 15 characters or lacks analytical substance, it should be categorized with `"Reaction Only"` as the tag.
+  - **is_substantive**: Whether the text gives a specific why/how reason for liking, disliking, defending, criticizing, or interpreting the couple.
+  - **reception_reason**: A concise 2-6 word reason for the reception when the text is substantive.
+  - **raw_tag**: A single primary descriptive tag (typically 2-5 words, e.g., `"earned emotional payoff"`, `"forced conflict writing"`, `"chemistry through banter"`). If the content has no meaningful reception reason, the model returns `"Reaction Only"`.
+- **Substance Check Guideline**: The LLM prompt now treats affect-only responses more strictly. Short or long text can be marked non-substantive when it only expresses intensity, excitement, dislike, shipping, meme-like reaction, or parasocial attachment without a concrete cause.
 - On success, updates the item's status to `processed`. On repeated failures, sets status to `failed`.
 
 ### 3. Stage 2: Thematic Clustering (`analyzer.py`)
 
-- Queries the database for all unique `raw_tag` values from the `TagMapping` table where `consolidated_tag IS NULL`.
-- Feeds the list of unique raw tags to `gemini-3-flash` (or `gemini-2.5-flash`) via the official `google-genai` Python SDK in a single request, instructing it to cluster them into a consolidated list of 10-15 broader analytical themes.
-- Enforces the output schema using a Pydantic model (`class Stage2Output(BaseModel): tag_mappings: dict[str, str]`) passed directly to the `response_schema` configuration parameter.
-- Updates the `consolidated_tag` column in the `TagMapping` table, allowing easy aggregation of sentiment and frequency metrics by theme.
+Rather than relying on a single large LLM call to cluster tags, Stage 2 uses a hybrid semantic clustering pipeline:
 
-### 4. Utilities (`util.py`)
+1. **Embedding Generation**: Excludes non-substantive `"Reaction Only"` annotations, then combines reception reason, raw tag, and summary for each remaining annotation and retrieves semantic embedding vectors concurrently using `sentence-transformers/all-minilm-l12-v2` via OpenRouter. Stage 2 uses 10 concurrent OpenRouter requests by default with retry/backoff handling for transient rate-limit-like errors. Generated embeddings are cached as JSON-serialized float arrays in the `Annotation.embedding` column to avoid duplicate API requests.
+2. **Density-Based Clustering**: Runs `sklearn.cluster.HDBSCAN` on the normalized embedding vectors. This groups similar raw tags based on density and labels outliers as `-1` (noise).
+3. **Outlier Resolution**: For points marked as noise (`-1`), calculates their cosine similarity to the computed centroid of each valid cluster. Reassigns each outlier to its closest matching cluster centroid.
+4. **Cluster Labeling**: Takes the top $k$ (default 15) representative annotations closest to each cluster's centroid and sends clusters to the LLM concurrently (e.g. `google/gemma-4-26b-a4b-it`) to generate cohesive consolidated labels plus a one- or two-sentence explanation for why the label fits. Labels are prompted to describe the concrete reception reason, not merely emotional engagement, and are cleaned to remove control characters and generic placeholders before being saved.
+5. **Update**: Automatically propagates the new consolidated labels and cluster IDs to the database.
+
+### 4. Visualizations & Analytics (`visualization.py`)
+
+Provides rich analytical plots to explore processed data:
+- **Semantic Mapping (t-SNE)**: Projects high-dimensional tag/summary embeddings to a 2D space, colored by their consolidated theme, to inspect cluster density and semantic boundaries.
+- **Sentiment Score Distribution**: Shows the five discrete sentiment scores as relative grouped bars for all items, posts, and comments.
+- **Sentiment Composition by Theme**: Shows each theme as a normalized stacked bar so sentiment mix can be compared across clusters.
+- **Theme Dominance Bar Chart**: Compares consolidated theme volume with percentage labels for quick cluster-size comparison.
+- **Theme Dominance Pareto View**: Combines theme counts with cumulative share to show whether a few clusters dominate the dataset.
+- Theme-level views exclude non-substantive `"Reaction Only"` annotations by default so they focus on interpretable reception reasons.
+
+Every plot supports either interactive preview windows or high-resolution PNG exports. Default export filenames include the active workspace and visualization type, such as `plots/jake_amy_semantic_map.png`.
+
+### 5. Utilities (`util.py`)
 
 - Facilitates data importing and exporting to CSV/JSON to aid final essay writing and graph plotting.
+- `export_theme_pareto_data.py` exports chart-ready theme dominance Pareto data from any selected workspace DB:
+  - CSV: `uv run python export_theme_pareto_data.py --db jake_amy.db --format csv`
+  - XLSX: `uv run python export_theme_pareto_data.py --db jake_amy.db --format xlsx`
+  - Output columns include `theme`, `items_in_theme`, and `cumulative_share_percent`, which can be used in Word/Excel to recreate the Pareto chart at report-friendly dimensions.
+- `export_theme_dominance_summary.py` exports a report-ready table of `consolidated_tag`, one-decimal dominance percentage, and consolidated tag explanation in decreasing dominance order.
 
 ---
 
 ## Configuration & Setup
 
-Environment variables will be managed using a local `.env` file loaded via `dotenv` in `main.py`:
+Environment variables will be managed using a local `.env` file loaded via `dotenv` in `main.py`. Reference `.env.example` for details:
 
-- Reddit API credentials (`REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`)
-- Ollama API endpoint config (e.g. `OLLAMA_HOST` defaulting to `http://localhost:11434` and `OLLAMA_MODEL` defaulting to `gemma4:e4b`)
-- Gemini API config (`GEMINI_API_KEY` and optional `GEMINI_MODEL` defaulting to `gemini-2.5-flash`)
+- **Reddit API**: `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`
+- **OpenRouter & LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (e.g., `google/gemma-4-26b-a4b-it`), `OPENROUTER_MODEL_STAGE2` (defaults to `google/gemma-4-26b-a4b-it`)
+
+### Package Management & Execution
+
+We use `uv` for lightning-fast package management and execution:
+* **Install dependencies**: `uv sync`
+* **Run CLI pipeline wizard**: `uv run python main.py`
+* **Run unit tests**: `uv run pytest`

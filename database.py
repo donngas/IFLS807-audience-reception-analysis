@@ -1,6 +1,11 @@
 import os
 from typing import Optional, List
 from sqlmodel import Field, SQLModel, Session, create_engine, select, func
+from sqlalchemy import inspect, text
+from dotenv import load_dotenv
+
+# Load environment variables at module import time
+load_dotenv()
 
 # Database Schema
 
@@ -12,9 +17,6 @@ class Post(SQLModel, table=True):
     score: int
     created_utc: float
     status: str = Field(default="pending", description="pending | processed | failed | skipped")
-    sentiment: Optional[float] = None
-    summary: Optional[str] = None
-    raw_tag: Optional[str] = None
 
 class Comment(SQLModel, table=True):
     id: str = Field(primary_key=True, description="Reddit Comment ID")
@@ -23,23 +25,46 @@ class Comment(SQLModel, table=True):
     score: int
     created_utc: float
     status: str = Field(default="pending", description="pending | processed | failed | skipped")
-    sentiment: Optional[float] = None
-    summary: Optional[str] = None
-    raw_tag: Optional[str] = None
 
-class TagMapping(SQLModel, table=True):
-    raw_tag: str = Field(primary_key=True, description="Primary Key")
-    consolidated_tag: Optional[str] = None
+class Annotation(SQLModel, table=True):
+    item_id: str = Field(primary_key=True, description="Reddit Post ID or Comment ID")
+    item_type: str = Field(description="post | comment")
+    sentiment: float
+    summary: str
+    raw_tag: str
+    is_substantive: bool = Field(default=True)
+    reception_reason: Optional[str] = Field(default=None, nullable=True)
+    consolidated_tag: Optional[str] = Field(default=None, nullable=True)
+    cluster_explanation: Optional[str] = Field(default=None, nullable=True)
+    cluster_id: Optional[int] = Field(default=None, nullable=True)
+    embedding: Optional[str] = Field(default=None, description="JSON serialized array of floats")
 
 
 # Database Connection & Setup
 
-sqlite_file_name = "audience_reception.db"
+sqlite_file_name = os.environ.get("WORKSPACE_DB", "audience_reception.db")
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url, echo=False)
 
 def init_db():
     SQLModel.metadata.create_all(engine)
+    ensure_annotation_schema()
+
+def ensure_annotation_schema():
+    """Add nullable columns introduced after the first workspace schema."""
+    inspector = inspect(engine)
+    if "annotation" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("annotation")}
+    with engine.begin() as conn:
+        if "cluster_explanation" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN cluster_explanation VARCHAR"))
+        if "is_substantive" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN is_substantive BOOLEAN NOT NULL DEFAULT 1"))
+            conn.execute(text("UPDATE annotation SET is_substantive = 0 WHERE LOWER(raw_tag) = 'reaction only'"))
+        if "reception_reason" not in columns:
+            conn.execute(text("ALTER TABLE annotation ADD COLUMN reception_reason VARCHAR"))
+            conn.execute(text("UPDATE annotation SET reception_reason = raw_tag WHERE is_substantive = 1"))
 
 def get_session():
     with Session(engine) as session:
@@ -57,6 +82,11 @@ def upsert_comment(session: Session, comment: Comment):
     session.merge(comment)
     session.commit()
 
+def upsert_annotation(session: Session, annotation: Annotation):
+    """Upsert an annotation using session.merge()"""
+    session.merge(annotation)
+    session.commit()
+
 def get_pending_posts(session: Session, limit: int = 50) -> List[Post]:
     statement = select(Post).where(Post.status == "pending").limit(limit)
     return session.exec(statement).all()
@@ -66,27 +96,107 @@ def get_pending_comments(session: Session, limit: int = 50) -> List[Comment]:
     return session.exec(statement).all()
 
 def get_unmapped_raw_tags(session: Session) -> List[str]:
-    statement = select(TagMapping.raw_tag).where(TagMapping.consolidated_tag == None)
+    statement = select(Annotation.raw_tag).where(Annotation.consolidated_tag == None).distinct()
     return session.exec(statement).all()
 
-def upsert_tag_mapping(session: Session, tag: str, consolidated: Optional[str] = None):
-    # Upsert logic to not overwrite consolidated if we are just adding the raw_tag
-    existing = session.get(TagMapping, tag)
-    if not existing:
-        new_tag = TagMapping(raw_tag=tag, consolidated_tag=consolidated)
-        session.add(new_tag)
-    else:
-        if consolidated is not None:
-            existing.consolidated_tag = consolidated
-            session.add(existing)
+def update_consolidated_tags(session: Session, tag_mappings: dict[str, str]):
+    """Update consolidated_tag in Annotation table for all matching raw_tags"""
+    for raw, consolidated in tag_mappings.items():
+        statement = select(Annotation).where(Annotation.raw_tag == raw)
+        annotations = session.exec(statement).all()
+        for ann in annotations:
+            ann.consolidated_tag = consolidated
+            session.add(ann)
+    session.commit()
+
+def reset_failed_items(session: Session, item_type: str):
+    """Reset status of failed posts or comments back to pending"""
+    if item_type == "post":
+        statement = select(Post).where(Post.status == "failed")
+        items = session.exec(statement).all()
+        for item in items:
+            item.status = "pending"
+            session.add(item)
+    elif item_type == "comment":
+        statement = select(Comment).where(Comment.status == "failed")
+        items = session.exec(statement).all()
+        for item in items:
+            item.status = "pending"
+            session.add(item)
+    session.commit()
+
+def reset_processed_items(session: Session, item_type: str):
+    """Reset status of processed posts or comments back to pending and remove their annotations"""
+    if item_type == "post":
+        posts_stmt = select(Post).where(Post.status == "processed")
+        posts = session.exec(posts_stmt).all()
+        for p in posts:
+            p.status = "pending"
+            session.add(p)
+            ann = session.get(Annotation, p.id)
+            if ann:
+                session.delete(ann)
+    elif item_type == "comment":
+        comments_stmt = select(Comment).where(Comment.status == "processed")
+        comments = session.exec(comments_stmt).all()
+        for c in comments:
+            c.status = "pending"
+            session.add(c)
+            ann = session.get(Annotation, c.id)
+            if ann:
+                session.delete(ann)
+    session.commit()
+
+def clear_stage_2_clustering(session: Session):
+    """Wipe cluster assignments and consolidated tags from all annotations"""
+    statement = select(Annotation)
+    annotations = session.exec(statement).all()
+    for ann in annotations:
+        ann.cluster_id = None
+        ann.consolidated_tag = None
+        ann.cluster_explanation = None
+        session.add(ann)
+    session.commit()
+
+def reset_specific_items(session: Session, item_ids: List[str]):
+    """Reset specific posts or comments by ID back to pending and remove annotations if present"""
+    for item_id in item_ids:
+        post = session.get(Post, item_id)
+        if post:
+            post.status = "pending"
+            session.add(post)
+            ann = session.get(Annotation, item_id)
+            if ann:
+                session.delete(ann)
+        comment = session.get(Comment, item_id)
+        if comment:
+            comment.status = "pending"
+            session.add(comment)
+            ann = session.get(Annotation, item_id)
+            if ann:
+                session.delete(ann)
+    session.commit()
+
+def nuke_database(session: Session):
+    """Delete all rows from all tables"""
+    from sqlmodel import delete
+    session.exec(delete(Annotation))
+    session.exec(delete(Comment))
+    session.exec(delete(Post))
     session.commit()
 
 def get_statistics(session: Session) -> dict:
     post_stats = session.exec(select(Post.status, func.count(Post.id)).group_by(Post.status)).all()
     comment_stats = session.exec(select(Comment.status, func.count(Comment.id)).group_by(Comment.status)).all()
     
-    avg_post_sentiment = session.exec(select(func.avg(Post.sentiment)).where(Post.sentiment != None)).first()
-    avg_comment_sentiment = session.exec(select(func.avg(Comment.sentiment)).where(Comment.sentiment != None)).first()
+    avg_post_sentiment = session.exec(
+        select(func.avg(Annotation.sentiment))
+        .where(Annotation.item_type == "post")
+    ).first()
+    avg_comment_sentiment = session.exec(
+        select(func.avg(Annotation.sentiment))
+        .where(Annotation.item_type == "comment")
+    ).first()
     
     return {
         "post_status_counts": dict(post_stats),
